@@ -1,210 +1,236 @@
-
+#!/usr/bin/env python3
 import time
 import RPi.GPIO as GPIO
+import sys
 
-from src.ssr_pwm import SSR_PWM
-from src.relay_control import RelayControl
-from src.stepper_motor import StepperMotor
 from src.sht31_sensor import SHT31Sensor
+from src.mhz19c_sensor import MHZ19CSensor
 from src.pzem004t_sensor import PZEM004TSensor
 from src.mcp3008_adc import MCP3008ADC
+from src.ssr_pwm import SSR_PWM
+from src.drv8825_stepper import DRV8825Stepper
 
 # --- Configuration --- #
-# GPIO Pin Definitions (BCM numbering)
-# Adjust these based on your actual wiring
+# SSR PWM 제어 핀
+HEATER_SSR_PIN = 17          # PTC 팬히터
+LED_SSR_PIN = 27             # COB LED바
+FAN_SSR_PIN = 22             # JK 쿨러 (팬)
+PUMP_SSR_PIN = 23            # 워터펌프
 
-# SSR PWM
-HEATER_SSR_PIN = 18 # Example GPIO pin for Heater SSR
-LED_SSR_PIN = 19    # Example GPIO pin for LED SSR
+# DRV8825 스테퍼 드라이버
+STEPPER_STEP_PIN = 18        # STEP 신호
+STEPPER_DIR_PIN = 24         # DIR 신호
 
-# Relays (for water pump, fan, etc.)
-WATER_PUMP_RELAY_PIN = 23 # Example GPIO pin for Water Pump Relay
-FAN_RELAY_PIN = 24        # Example GPIO pin for Fan Relay
-
-# Stepper Motors (ULN2003 driver)
-# Stepper Motor 1 (e.g., for main group)
-STEPPER1_IN1 = 5
-STEPPER1_IN2 = 6
-STEPPER1_IN3 = 13
-STEPPER1_IN4 = 19
-
-# Stepper Motor 2 (e.g., for experimental group)
-STEPPER2_IN1 = 16
-STEPPER2_IN2 = 20
-STEPPER2_IN3 = 21
-STEPPER2_IN4 = 26
-
-# SHT31 Sensor (I2C)
-SHT31_I2C_ADDRESS = 0x44 # Default address, check your sensor
-SHT31_BUS_NUM = 1        # I2C bus number (usually 1 for Raspberry Pi)
-
-# PZEM-004T Sensor (UART)
-# Based on Excel: #0(ID1), #1(ID0) are used for PZEM-004T (A)
-# On RPi 5, GPIO 0/1 are often ID_SD/ID_SC but can be used as UART
-PZEM_SERIAL_PORT = "/dev/ttyAMA0" # Adjust if using a specific UART port
-PZEM_BAUD_RATE = 9600
-PZEM_SLAVE_ADDRESS = 0xF8
-
-# MCP3008 ADC (SPI)
-ADC_SPI_CHANNEL = 0 # SPI bus 0
-ADC_SPI_DEVICE = 0  # SPI device 0 (CE0)
-# ADC Channels based on Excel
-# Soil moisture (A) -> CH0, Soil moisture (B) -> CH1
-ADC_SOIL_MOISTURE_A_CHANNEL = 0
-ADC_SOIL_MOISTURE_B_CHANNEL = 1
-ADC_LIGHT_CHANNEL = 2 # Adjusted as CH0/1 are taken by soil moisture sensors
+# 센서 설정
+SHT31_ADDRESS = 0x44
+MHZ19C_PORT = '/dev/ttyAMA0'  # UART0
+PZEM_PORT = '/dev/ttyS0'      # UART1
 
 # --- Hardware Initialization --- #
 def initialize_hardware():
-    global heater_ssr, led_ssr, water_pump_relay, fan_relay, stepper1, stepper2, sht31, pzem, adc
-
+    global heater_ssr, led_ssr, fan_ssr, pump_ssr, stepper, sht31, mhz19c, pzem, adc
+    
     GPIO.setmode(GPIO.BCM)
     GPIO.setwarnings(False)
-
-    print("Initializing hardware components...")
-
-    # SSR PWM
-    heater_ssr = SSR_PWM(pin=HEATER_SSR_PIN)
-    led_ssr = SSR_PWM(pin=LED_SSR_PIN)
-
-    # Relays
-    water_pump_relay = RelayControl(pin=WATER_PUMP_RELAY_PIN)
-    fan_relay = RelayControl(pin=FAN_RELAY_PIN)
-
-    # Stepper Motors
-    stepper1 = StepperMotor(in1_pin=STEPPER1_IN1, in2_pin=STEPPER1_IN2, in3_pin=STEPPER1_IN3, in4_pin=STEPPER1_IN4)
-    stepper2 = StepperMotor(in1_pin=STEPPER2_IN1, in2_pin=STEPPER2_IN2, in3_pin=STEPPER2_IN3, in4_pin=STEPPER2_IN4)
-
-    # SHT31 Sensor
-    sht31 = SHT31Sensor(i2c_address=SHT31_I2C_ADDRESS, bus_num=SHT31_BUS_NUM)
-
-    # PZEM-004T Sensor
-    pzem = PZEM004TSensor(serial_port=PZEM_SERIAL_PORT, baud_rate=PZEM_BAUD_RATE, slave_address=PZEM_SLAVE_ADDRESS)
-
-    # MCP3008 ADC
-    adc = MCP3008ADC(spi_channel=ADC_SPI_CHANNEL, spi_device=ADC_SPI_DEVICE)
-
-    print("Hardware initialization complete.")
+    
+    print("=" * 60)
+    print("ARES System Initialization")
+    print("=" * 60)
+    
+    try:
+        # SSR PWM 초기화
+        print("\n[1/7] Initializing SSR PWM modules...")
+        heater_ssr = SSR_PWM(pin=HEATER_SSR_PIN)
+        led_ssr = SSR_PWM(pin=LED_SSR_PIN)
+        fan_ssr = SSR_PWM(pin=FAN_SSR_PIN)
+        pump_ssr = SSR_PWM(pin=PUMP_SSR_PIN)
+        
+        # DRV8825 스테퍼 드라이버 초기화
+        print("[2/7] Initializing DRV8825 Stepper Driver...")
+        stepper = DRV8825Stepper(step_pin=STEPPER_STEP_PIN, dir_pin=STEPPER_DIR_PIN)
+        
+        # SHT31 센서 초기화
+        print("[3/7] Initializing SHT31 Temperature/Humidity Sensor...")
+        sht31 = SHT31Sensor(i2c_address=SHT31_ADDRESS)
+        
+        # MH-Z19C CO2 센서 초기화
+        print("[4/7] Initializing MH-Z19C CO2 Sensor...")
+        mhz19c = MHZ19CSensor(port=MHZ19C_PORT)
+        
+        # PZEM-004T 전력 측정 센서 초기화
+        print("[5/7] Initializing PZEM-004T Power Sensor...")
+        pzem = PZEM004TSensor(port=PZEM_PORT)
+        
+        # MCP3008 ADC 초기화
+        print("[6/7] Initializing MCP3008 ADC...")
+        adc = MCP3008ADC()
+        
+        print("[7/7] All hardware initialized successfully!")
+        print("=" * 60)
+        
+    except Exception as e:
+        print(f"Error during hardware initialization: {e}")
+        cleanup_hardware()
+        sys.exit(1)
 
 def cleanup_hardware():
-    print("Cleaning up hardware resources...")
-    heater_ssr.cleanup()
-    led_ssr.cleanup()
-    water_pump_relay.cleanup()
-    fan_relay.cleanup()
-    stepper1.cleanup()
-    stepper2.cleanup()
-    pzem.cleanup() # SHT31 and ADC don't have explicit cleanup methods beyond closing bus
-    adc.cleanup()
+    print("\nCleaning up hardware resources...")
+    try:
+        heater_ssr.cleanup()
+        led_ssr.cleanup()
+        fan_ssr.cleanup()
+        pump_ssr.cleanup()
+        stepper.cleanup()
+        sht31.cleanup()
+        mhz19c.cleanup()
+        pzem.cleanup()
+        adc.cleanup()
+    except:
+        pass
     GPIO.cleanup()
     print("Hardware cleanup complete.")
 
 # --- Sensor Monitoring --- #
 def read_sensor_data():
     data = {}
+    
+    # SHT31 데이터
     try:
         temp, hum = sht31.read_data()
-        data["temperature"] = f"{temp:.2f} C"
-        data["humidity"] = f"{hum:.2f} %"
+        if temp is not None and hum is not None:
+            data["temperature"] = f"{temp:.2f}C"
+            data["humidity"] = f"{hum:.2f}%"
+        else:
+            data["temperature"] = "Error"
+            data["humidity"] = "Error"
     except Exception as e:
-        data["temperature"] = "Error"
-        data["humidity"] = "Error"
-        print(f"Error reading SHT31: {e}")
-
+        data["temperature"] = data["humidity"] = "Error"
+    
+    # MH-Z19C CO2 데이터
     try:
-        pzem_data = pzem.read_all_data()
-        if pzem_data:
-            data["voltage"] = f"{pzem_data['voltage']:.2f}V"
-            data["current"] = f"{pzem_data['current']:.3f}A"
-            data["power"] = f"{pzem_data['power']:.2f}W"
-            data["energy"] = f"{pzem_data['energy']:.3f}kWh"
+        co2 = mhz19c.read_co2()
+        if co2 is not None:
+            data["co2"] = f"{co2} ppm"
+        else:
+            data["co2"] = "Error"
+    except Exception as e:
+        data["co2"] = "Error"
+    
+    # PZEM-004T 전력 데이터
+    try:
+        power_data = pzem.read_power_data()
+        if power_data:
+            data["voltage"] = f"{power_data['voltage']:.1f}V"
+            data["current"] = f"{power_data['current']:.3f}A"
+            data["power"] = f"{power_data['power']:.1f}W"
+            data["energy"] = f"{power_data['energy']:.3f}kWh"
         else:
             data["voltage"] = data["current"] = data["power"] = data["energy"] = "Error"
     except Exception as e:
         data["voltage"] = data["current"] = data["power"] = data["energy"] = "Error"
-        print(f"Error reading PZEM-004T: {e}")
-
+    
+    # MCP3008 ADC 데이터
     try:
-        data["light"] = adc.read_channel(ADC_LIGHT_CHANNEL)
-        data["soil_moisture_a"] = adc.read_channel(ADC_SOIL_MOISTURE_A_CHANNEL)
-        data["soil_moisture_b"] = adc.read_channel(ADC_SOIL_MOISTURE_B_CHANNEL)
+        ch0 = adc.read_channel(0)  # 외부 일사량 (조도)
+        ch1 = adc.read_channel(1)  # 외부 온도 (환경 참조)
+        ch2 = adc.read_channel(2)  # 강우 감지 (보안)
+        
+        data["light"] = f"{adc.convert_to_voltage(ch0):.3f}V" if ch0 else "Error"
+        data["ext_temp"] = f"{adc.convert_to_voltage(ch1):.3f}V" if ch1 else "Error"
+        data["rain"] = f"{adc.convert_to_voltage(ch2):.3f}V" if ch2 else "Error"
     except Exception as e:
-        data["light"] = data["soil_moisture_a"] = data["soil_moisture_b"] = "Error"
-        print(f"Error reading MCP3008 ADC: {e}")
-
+        data["light"] = data["ext_temp"] = data["rain"] = "Error"
+    
     return data
 
 # --- CLI for Control and Monitoring --- #
 def run_cli():
-    print("\n--- Ares System CLI ---")
-    print("Type 'help' for commands.")
-
+    print("\n" + "=" * 60)
+    print("ARES System CLI - Type 'help' for commands")
+    print("=" * 60 + "\n")
+    
     while True:
         try:
             command = input("Ares> ").strip().lower()
-
+            
             if command == "help":
-                print("Commands:")
-                print("  status        - Display current sensor readings")
-                print("  heater <0-100> - Set heater power percentage (e.g., heater 50)")
-                print("  led <0-100>    - Set LED power percentage (e.g., led 75)")
-                print("  pump on/off   - Turn water pump on or off")
-                print("  fan on/off    - Turn fan on or off")
-                print("  stepper1 <steps> <dir> - Move stepper motor 1 (e.g., stepper1 200 forward)")
-                print("  stepper2 <steps> <dir> - Move stepper motor 2")
-                print("  exit          - Exit the CLI and clean up")
+                print("\nAvailable Commands:")
+                print("  status              - Display all sensor readings")
+                print("  heater <0-100>      - Set heater power (e.g., heater 50)")
+                print("  led <0-100>         - Set LED brightness (e.g., led 75)")
+                print("  fan <0-100>         - Set fan speed (e.g., fan 80)")
+                print("  pump <0-100>        - Set pump power (e.g., pump 60)")
+                print("  window <steps> <dir> - Control window (e.g., window 100 open)")
+                print("  exit                - Exit the CLI and clean up")
+                print()
+            
             elif command == "status":
                 sensor_data = read_sensor_data()
-                print("\n--- Sensor Status ---")
-                for key, value in sensor_data.items():
-                    print(f"  {key.replace('_', ' ').title()}: {value}")
-                print("---------------------")
+                print("\n" + "-" * 60)
+                print("SENSOR STATUS")
+                print("-" * 60)
+                print(f"Temperature:        {sensor_data.get('temperature', 'N/A')}")
+                print(f"Humidity:           {sensor_data.get('humidity', 'N/A')}")
+                print(f"CO2 Concentration:  {sensor_data.get('co2', 'N/A')}")
+                print(f"Voltage:            {sensor_data.get('voltage', 'N/A')}")
+                print(f"Current:            {sensor_data.get('current', 'N/A')}")
+                print(f"Power:              {sensor_data.get('power', 'N/A')}")
+                print(f"Energy:             {sensor_data.get('energy', 'N/A')}")
+                print(f"Light:              {sensor_data.get('light', 'N/A')}")
+                print(f"Ext. Temp:          {sensor_data.get('ext_temp', 'N/A')}")
+                print(f"Rain:               {sensor_data.get('rain', 'N/A')}")
+                print("-" * 60 + "\n")
+            
             elif command.startswith("heater "):
                 try:
                     percentage = int(command.split(" ")[1])
                     heater_ssr.set_duty_cycle(percentage)
                 except (IndexError, ValueError):
                     print("Invalid command. Usage: heater <0-100>")
+            
             elif command.startswith("led "):
                 try:
                     percentage = int(command.split(" ")[1])
                     led_ssr.set_duty_cycle(percentage)
                 except (IndexError, ValueError):
                     print("Invalid command. Usage: led <0-100>")
-            elif command == "pump on":
-                water_pump_relay.on()
-            elif command == "pump off":
-                water_pump_relay.off()
-            elif command == "fan on":
-                fan_relay.on()
-            elif command == "fan off":
-                fan_relay.off()
-            elif command.startswith("stepper1 "):
+            
+            elif command.startswith("fan "):
+                try:
+                    percentage = int(command.split(" ")[1])
+                    fan_ssr.set_duty_cycle(percentage)
+                except (IndexError, ValueError):
+                    print("Invalid command. Usage: fan <0-100>")
+            
+            elif command.startswith("pump "):
+                try:
+                    percentage = int(command.split(" ")[1])
+                    pump_ssr.set_duty_cycle(percentage)
+                except (IndexError, ValueError):
+                    print("Invalid command. Usage: pump <0-100>")
+            
+            elif command.startswith("window "):
                 try:
                     parts = command.split(" ")
                     steps = int(parts[1])
                     direction_str = parts[2].lower()
-                    direction = 1 if direction_str == "forward" else -1
-                    stepper1.move_steps(steps, direction)
+                    direction = 1 if direction_str == "open" else -1
+                    stepper.move_steps(steps, direction)
                 except (IndexError, ValueError):
-                    print("Invalid command. Usage: stepper1 <steps> <forward/backward>")
-            elif command.startswith("stepper2 "):
-                try:
-                    parts = command.split(" ")
-                    steps = int(parts[1])
-                    direction_str = parts[2].lower()
-                    direction = 1 if direction_str == "forward" else -1
-                    stepper2.move_steps(steps, direction)
-                except (IndexError, ValueError):
-                    print("Invalid command. Usage: stepper2 <steps> <forward/backward>")
+                    print("Invalid command. Usage: window <steps> <open/close>")
+            
             elif command == "exit":
-                print("Exiting CLI.")
+                print("Exiting ARES System CLI...")
                 break
+            
             else:
-                print("Unknown command. Type 'help' for commands.")
-
+                print("Unknown command. Type 'help' for available commands.")
+        
+        except KeyboardInterrupt:
+            print("\nInterrupted by user.")
+            break
         except Exception as e:
-            print(f"An error occurred in CLI: {e}")
+            print(f"Error: {e}")
 
 # --- Main Execution --- #
 if __name__ == '__main__':
@@ -212,9 +238,9 @@ if __name__ == '__main__':
         initialize_hardware()
         run_cli()
     except KeyboardInterrupt:
-        print("Program interrupted by user.")
+        print("\n\nProgram interrupted by user.")
     except Exception as e:
         print(f"A critical error occurred: {e}")
     finally:
         cleanup_hardware()
-
+        print("\nARES System shutdown complete.")

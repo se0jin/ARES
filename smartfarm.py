@@ -28,8 +28,12 @@ def read_co2():
     return resp[2]*256 + resp[3]
 
 def read_soil():
-    voltage = chan.voltage
-    pct = max(0, min(100, (0.572 - voltage) / (0.572 - 0.190) * 100))
+    voltages = []
+    for _ in range(5):
+        voltages.append(chan.voltage)
+        time.sleep(0.1)
+    voltage = sum(voltages) / len(voltages)
+    pct = max(0, min(100, (voltage - 0.190) / (0.572 - 0.190) * 100))
     return round(pct)
 
 def send_data():

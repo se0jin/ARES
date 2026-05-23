@@ -19,6 +19,7 @@ WORKDIR /app
 COPY requirements.txt .
 
 # 4단계: 패키지 설치
+RUN apt-get update && apt-get install -y libgomp1 && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 5단계: 소스코드 및 모델 복사

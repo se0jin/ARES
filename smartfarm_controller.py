@@ -632,7 +632,7 @@ def job():
 
     ctrl = compute_control(sensor)
     for note in ctrl.notes:    # ← 버그 수정: '음표' -> note
-        log.info(음표)
+        log.info(note)
 
     apply_control(ctrl)
     save_to_db(sensor)

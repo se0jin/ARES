@@ -178,7 +178,12 @@ def build_features(target_row: dict, lag_rows: list[dict]) -> pd.DataFrame:
     dt = pd.to_datetime(row["datetime"])
 
     # 파생 피처
-    row["temp_diff"]   = float(row["temp_in"]) - float(row["temp_out"])
+    # None 방어 처리
+    temp_in  = float(row.get("temp_in")  or 20.0)
+    temp_out = float(row.get("temp_out") or 15.0)
+    row["temp_in"]  = temp_in
+    row["temp_out"] = temp_out
+    row["temp_diff"] = temp_in - temp_out
 
     # 시간 피처
     row["hour"]        = dt.hour
@@ -781,13 +786,9 @@ class Pipeline:
                     f"팬={ctrl['fan_on_sec']}s 창문={ctrl['window_on_sec']}s "
                     f"히터={ctrl['heater_on_sec']}s 펌프={ctrl['pump_on_sec']}s"
                 )
-                # DB2 제어 컬럼 업데이트 (컬럼이 존재하는 경우)
-                try:
-                    self.db2.table("sensor_data_2").update(ctrl).eq(
-                        "datetime", row["datetime"]
-                    ).execute()
-                except Exception:
-                    pass
+                # DB2 제어 컬럼 업데이트 생략 (sensor_data_2에 제어 컬럼 없음)
+                # 제어는 smartfarm_controller.py가 직접 담당
+                pass
             except Exception as e:
                 log.error(f"제어 계산 오류: {e}")
 

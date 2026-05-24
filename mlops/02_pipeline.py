@@ -193,9 +193,14 @@ def build_features(target_row: dict, lag_rows: list[dict]) -> pd.DataFrame:
     # lag 피처 (co2 → co2_predicted 재활용)
     for lag_idx, lag_row in enumerate(lag_rows, start=1):
         for col in LAG_COLS_RAW:
-            val = (lag_row.get("co2_predicted") or lag_row.get(col)) if col == "co2_in" \
-                  else lag_row.get(col)
-            row[f"{col}_lag{lag_idx}"] = float(val) if val is not None else np.nan
+            try:
+                if col == "co2_in":
+                    val = lag_row.get("co2_predicted") or lag_row.get("co2_in")
+                else:
+                    val = lag_row.get(col)
+                row[f"{col}_lag{lag_idx}"] = float(val) if val is not None else np.nan
+            except (TypeError, ValueError):
+                row[f"{col}_lag{lag_idx}"] = np.nan
 
     feat_df = pd.DataFrame([{k: row.get(k, np.nan) for k in FEATURE_COLS}])
     if feat_df.isna().sum().sum() > 0:

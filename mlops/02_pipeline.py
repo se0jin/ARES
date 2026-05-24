@@ -198,6 +198,11 @@ def build_features(target_row: dict, lag_rows: list[dict]) -> pd.DataFrame:
             row[f"{col}_lag{lag_idx}"] = float(val) if val is not None else np.nan
 
     feat_df = pd.DataFrame([{k: row.get(k, np.nan) for k in FEATURE_COLS}])
+
+    # 모든 피처 float 변환 (object 타입 방지)
+    for col in feat_df.columns:
+        feat_df[col] = pd.to_numeric(feat_df[col], errors="coerce")
+
     if feat_df.isna().sum().sum() > 0:
         log.warning("피처 NaN 발생 → ffill/bfill 처리")
         feat_df = feat_df.ffill().bfill()
@@ -253,7 +258,7 @@ def poll_and_predict(db2: Client, model: lgb.LGBMRegressor) -> list[dict]:
 
             db2.table("sensor_data_2").update(
                 {"co2_predicted": round(pred, 2)}
-            ).eq("datetime", dt_str).execute()
+            ).eq("ID", target_row["ID"]).execute()
 
             log.info(f"  [{dt_str}] co2_predicted = {pred:.1f} ppm")
             target_row["co2_predicted"] = pred

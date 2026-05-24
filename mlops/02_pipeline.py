@@ -456,7 +456,7 @@ def run_monitoring(db2: Client, db3: Client,
     # DB3 실제값
     dt_list = pred_df["datetime"].tolist()
     res3 = (
-        db3.table("CO2_in")
+        db3.table("sensor_data_3")
         .select("datetime, co2_in")
         .in_("datetime", dt_list)
         .execute()

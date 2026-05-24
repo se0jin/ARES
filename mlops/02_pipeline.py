@@ -575,6 +575,45 @@ def run_monitoring(db2: Client, db3: Client,
 # ─────────────────────────────────────────────────────────────────────
 # 9. 10강: 자동 재학습 — 4종 트리거 + Production 승격 비교
 # ─────────────────────────────────────────────────────────────────────
+def build_train_features(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    DB1 원본 데이터 → 학습용 피처 엔지니어링
+    (temp_diff, 시간 피처, lag 피처, next_co2_in 생성)
+    """
+    df = raw_df.copy().sort_values("datetime").reset_index(drop=True)
+    df["datetime"] = pd.to_datetime(df["datetime"])
+
+    # 시간 피처
+    df["hour"]        = df["datetime"].dt.hour
+    df["month"]       = df["datetime"].dt.month
+    df["day_of_week"] = df["datetime"].dt.dayofweek
+    df["is_daytime"]  = ((df["hour"] >= 6) & (df["hour"] <= 19)).astype(float)
+    df["hour_sin"]    = np.sin(2 * np.pi * df["hour"] / 24)
+    df["hour_cos"]    = np.cos(2 * np.pi * df["hour"] / 24)
+    df["month_sin"]   = np.sin(2 * np.pi * df["month"] / 12)
+    df["month_cos"]   = np.cos(2 * np.pi * df["month"] / 12)
+
+    # 파생 피처
+    df["temp_in"]  = pd.to_numeric(df["temp_in"],  errors="coerce").fillna(20.0)
+    df["temp_out"] = pd.to_numeric(df["temp_out"], errors="coerce").fillna(15.0)
+    df["temp_diff"] = df["temp_in"] - df["temp_out"]
+
+    # lag 피처
+    for col in LAG_COLS_RAW:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+        for lag in range(1, 4):
+            df[f"{col}_lag{lag}"] = df[col].shift(lag)
+
+    # next_co2_in (타겟) — 3시간 후 값
+    df["next_co2_in"] = df["co2_in"].shift(-3)
+
+    # 앞뒤 NaN 제거
+    df = df.dropna(subset=FEATURE_COLS + [TARGET_COL]).reset_index(drop=True)
+
+    log.info(f"피처 엔지니어링 완료: {len(df):,}행 / {len(FEATURE_COLS)}개 피처")
+    return df
+
+
 def run_retrain(db1: Client, trigger_reason: str = "manual") -> lgb.LGBMRegressor | None:
     """
     10강: DB1 최신 데이터 재학습 → 기존 Production 모델과 성능 비교
@@ -594,13 +633,12 @@ def run_retrain(db1: Client, trigger_reason: str = "manual") -> lgb.LGBMRegresso
             log.warning(f"재학습 데이터 부족 ({len(raw_df)} < {RETRAIN_DATA_MIN_ROWS}행) — 스킵")
             return None
 
-        required = FEATURE_COLS + [TARGET_COL]
-        missing  = [c for c in required if c not in raw_df.columns]
-        if missing:
-            log.error(f"재학습 컬럼 부재: {missing}")
-            return None
+        # DB1 원본 데이터 → 피처 엔지니어링
+        raw_df = build_train_features(raw_df)
 
-        raw_df = raw_df.dropna(subset=required).sort_values("datetime").reset_index(drop=True)
+        if len(raw_df) < RETRAIN_DATA_MIN_ROWS:
+            log.warning(f"피처 엔지니어링 후 데이터 부족 ({len(raw_df)}행) — 스킵")
+            return None
         n = len(raw_df)
         train_df = raw_df.iloc[:int(n * 0.70)]
         val_df   = raw_df.iloc[int(n * 0.70):int(n * 0.85)]

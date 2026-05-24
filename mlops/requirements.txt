@@ -6,3 +6,9 @@ scikit-learn==1.4.2
 joblib==1.4.0
 numpy==1.26.4
 pandas==2.2.2
+mlflow==2.13.0
+supabase==2.4.6
+requests==2.31.0
+schedule==1.2.1
+scipy==1.13.0
+evidently

@@ -624,9 +624,19 @@ def run_retrain(db1: Client, trigger_reason: str = "manual") -> lgb.LGBMRegresso
     log.info(f"=== [재학습 시작] 트리거: {trigger_reason} ===")
 
     try:
-        # DB1 전체 데이터 로드
-        res = db1.table("sensor_data").select("*").order("datetime").execute()
-        raw_df = pd.DataFrame(res.data)
+        # DB1 전체 데이터 로드 (Supabase 1000행 limit 우회 → 페이지네이션)
+        all_data = []
+        offset = 0
+        batch = 1000
+        while True:
+            res = db1.table("sensor_data").select("*").order("datetime").range(offset, offset + batch - 1).execute()
+            if not res.data:
+                break
+            all_data.extend(res.data)
+            if len(res.data) < batch:
+                break
+            offset += batch
+        raw_df = pd.DataFrame(all_data)
         log.info(f"DB1 로드: {len(raw_df):,}행")
 
         if len(raw_df) < RETRAIN_DATA_MIN_ROWS:

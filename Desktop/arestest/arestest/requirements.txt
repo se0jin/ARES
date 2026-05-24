@@ -1,0 +1,8 @@
+# 스마트팜 의존 패키지
+RPi.GPIO
+adafruit-blinka
+adafruit-circuitpython-htu21d
+adafruit-circuitpython-ads1x15
+adafruit-circuitpython-ina219
+mh-z19
+pyserial

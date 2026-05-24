@@ -771,14 +771,14 @@ class Pipeline:
         for row in predicted_rows:
             try:
                 ctrl = compute_control(
-                    co2_pred  = float(row.get("co2_predicted", 700)),
-                    temp_in   = float(row.get("temp_in",  20)),
-                    hum_in    = float(row.get("hum_in",   60)),
-                    soil_hum  = float(row.get("soil_hum", 30)),
-                    temp_out  = float(row.get("temp_out", 15)),
-                    rain_out  = float(row.get("rain_out",  0)),
-                    wind_out  = float(row.get("wind_out",  2)),
-                    solar_out = float(row.get("solar_out", 0)),
+                    co2_pred  = float(row.get("co2_predicted") or 700),
+                    temp_in   = float(row.get("temp_in")   or 20),
+                    hum_in    = float(row.get("hum_in")    or 60),
+                    soil_hum  = float(row.get("soil_hum")  or 30),
+                    temp_out  = float(row.get("temp_out")  or 15),
+                    rain_out  = float(row.get("rain_out")  or 0),
+                    wind_out  = float(row.get("wind_out")  or 2),
+                    solar_out = 0.0,
                     hour      = pd.to_datetime(row["datetime"]).hour,
                 )
                 log.info(

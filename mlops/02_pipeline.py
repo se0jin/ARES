@@ -586,7 +586,7 @@ def build_train_features(raw_df: pd.DataFrame) -> pd.DataFrame:
     (temp_diff, 시간 피처, lag 피처, next_co2_in 생성)
     """
     df = raw_df.copy().sort_values("datetime").reset_index(drop=True)
-    df["datetime"] = pd.to_datetime(df["datetime"])
+    df["datetime"] = pd.to_datetime(df["datetime"], format='mixed', utc=True)
 
     # 시간 피처
     df["hour"]        = df["datetime"].dt.hour

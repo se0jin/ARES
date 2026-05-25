@@ -470,13 +470,12 @@ def run_monitoring(db2: Client, db3: Client,
         log.warning("모니터링: DB3 실제값 없음 (아직 누적 중)")
         return None
 
-    merged = pd.merge(pred_df, actual_df, on="datetime", how="inner")
-    if len(merged) < 5:
-        # datetime 정확 매칭 실패 시 시간 단위로 truncate해서 재시도
-        pred_df["dt_hour"]   = pd.to_datetime(pred_df["datetime"],   utc=True).dt.floor("h")
-        actual_df["dt_hour"] = pd.to_datetime(actual_df["datetime"], utc=True).dt.floor("h")
-        merged = pd.merge(pred_df, actual_df, on="dt_hour", how="inner")
-        log.info(f"datetime truncate 매칭으로 재시도: {len(merged)}개")
+    # datetime을 시간 단위로 truncate해서 매칭 (초/마이크로초 차이 무시)
+    pred_df["dt_hour"]   = pd.to_datetime(pred_df["datetime"],   utc=True).dt.floor("h")
+    actual_df["dt_hour"] = pd.to_datetime(actual_df["datetime"], utc=True).dt.floor("h")
+    merged = pd.merge(pred_df, actual_df, on="dt_hour", how="inner")
+    log.info(f"datetime truncate 매칭: {len(merged)}개")
+
     if len(merged) < 5:
         log.warning(f"모니터링: 매칭 행 부족 ({len(merged)}개)")
         return None

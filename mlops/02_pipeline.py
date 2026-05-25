@@ -70,8 +70,8 @@ SUPABASE_KEY_DB2 = os.getenv("SUPABASE_KEY_DB2", "your-db2-key")
 SUPABASE_URL_DB3 = os.getenv("SUPABASE_URL_DB3", "https://your-db3.supabase.co")
 SUPABASE_KEY_DB3 = os.getenv("SUPABASE_KEY_DB3", "your-db3-key")
 
-# ── DB3 테이블명 (프로젝트 설계: CO2_in 테이블 / datetime + co2_in 2컬럼)
-DB3_TABLE_NAME = "CO2_in"
+# ── DB3 테이블명 (실제 Supabase DB3 테이블명: sensor_data_3)
+DB3_TABLE_NAME = "sensor_data_3"
 
 # ── 09강: Discord Webhook URL ────────────────────────────────────────
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")

@@ -604,10 +604,35 @@ def run_monitoring(db2: Client, db3: Client,
 def build_train_features(raw_df: pd.DataFrame) -> pd.DataFrame:
     """
     DB1 원본 데이터 → 학습용 피처 엔지니어링
-    ※ solar_out / rain_out / wind_out 컬럼 없어도 동작하도록 방어 처리
+    ※ solar_out / rain_out / wind_out 컬럼 없어도 동작
+    ※ datetime 비연속 구간 전후 행의 타겟/lag를 NaN으로 명시 처리
+       → shift(-3)이 다른 날짜 CO2와 엮이는 타겟 오염 완전 차단
     """
     df = raw_df.copy().sort_values("datetime").reset_index(drop=True)
     df["datetime"] = pd.to_datetime(df["datetime"], format="mixed", utc=True)
+
+    # ── datetime 비연속 구간 감지 (2시간 초과 간격 = 비연속) ─────────
+    time_diff_h = df["datetime"].diff().dt.total_seconds() / 3600
+    gap_after  = set(df.index[time_diff_h > 2].tolist())   # gap 직후 인덱스
+    # gap 직전 3행: shift(-3) 타겟이 gap 너머 값을 보는 행
+    gap_before = set()
+    for idx in gap_after:
+        for k in range(1, 4):
+            if idx - k >= 0:
+                gap_before.add(idx - k)
+    # gap 직후 3행: lag 피처가 오염되는 행
+    gap_lag = set()
+    for idx in gap_after:
+        for k in range(0, 3):
+            if idx + k < len(df):
+                gap_lag.add(idx + k)
+
+    contaminated = gap_before | gap_after | gap_lag
+    if contaminated:
+        log.warning(
+            f"datetime 비연속 구간 {len(gap_after)}개 → "
+            f"오염 가능 {len(contaminated)}행 타겟/lag NaN 처리"
+        )
 
     df["hour"]        = df["datetime"].dt.hour
     df["month"]       = df["datetime"].dt.month
@@ -622,7 +647,6 @@ def build_train_features(raw_df: pd.DataFrame) -> pd.DataFrame:
     df["temp_out"]  = pd.to_numeric(df.get("temp_out"), errors="coerce").fillna(15.0)
     df["temp_diff"] = df["temp_in"] - df["temp_out"]
 
-    # 선택적 컬럼 — 없으면 기본값
     df["rain_out"] = pd.to_numeric(df.get("rain_out", 0), errors="coerce").fillna(0)
     df["wind_out"] = pd.to_numeric(df.get("wind_out", 0), errors="coerce").fillna(0)
 
@@ -631,8 +655,17 @@ def build_train_features(raw_df: pd.DataFrame) -> pd.DataFrame:
         for lag in range(1, 4):
             df[f"{col}_lag{lag}"] = df[col].shift(lag)
 
-    # 타겟: 3시간 후 CO2 (학습 시 shift(-3) 사용 — 모델과 동일하게 맞춤)
+    # lag 오염 행 NaN 처리
+    lag_cols = [f"{col}_lag{lag}" for col in LAG_COLS_RAW for lag in range(1, 4)]
+    if gap_lag:
+        df.loc[list(gap_lag), lag_cols] = np.nan
+
+    # 타겟: 3시간 후 CO2
     df["next_co2_in"] = df["co2_in"].shift(-3)
+
+    # 타겟 오염 행 NaN 처리 → dropna로 자동 제거
+    if gap_before:
+        df.loc[list(gap_before), "next_co2_in"] = np.nan
 
     df = df.dropna(subset=FEATURE_COLS + [TARGET_COL]).reset_index(drop=True)
     log.info(f"피처 엔지니어링 완료: {len(df):,}행 / {len(FEATURE_COLS)}개 피처")
@@ -699,14 +732,6 @@ def run_retrain(db1: Client, trigger_reason: str = "manual") -> lgb.LGBMRegresso
             if len(raw_df) < RETRAIN_DATA_MIN_ROWS:
                 log.warning(f"재학습 데이터 부족 ({len(raw_df)} < {RETRAIN_DATA_MIN_ROWS}행) — 스킵")
                 return None
-
-            # datetime 연속성 검증 — 비연속 구간에서 shift(-3) 오류 방지
-            raw_df["datetime"] = pd.to_datetime(raw_df["datetime"], format="mixed", utc=True)
-            raw_df = raw_df.sort_values("datetime").reset_index(drop=True)
-            time_diffs = raw_df["datetime"].diff().dt.total_seconds() / 3600
-            gap_count = (time_diffs > 2).sum()
-            if gap_count > 0:
-                log.warning(f"datetime 비연속 구간 {gap_count}개 감지 — dropna로 타겟 오염 방지")
 
             raw_df = build_train_features(raw_df)
 

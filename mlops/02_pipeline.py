@@ -587,6 +587,35 @@ def run_monitoring(db2: Client, db3: Client,
 # ─────────────────────────────────────────────────────────────────────
 # 9. 10강: 자동 재학습 — 4종 트리거 + Production 승격 비교
 # ─────────────────────────────────────────────────────────────────────
+def build_train_features(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """DB1 원본 데이터 → 학습용 피처 엔지니어링"""
+    df = raw_df.copy().sort_values("datetime").reset_index(drop=True)
+    df["datetime"] = pd.to_datetime(df["datetime"], format='mixed', utc=True)
+
+    df["hour"]        = df["datetime"].dt.hour
+    df["month"]       = df["datetime"].dt.month
+    df["day_of_week"] = df["datetime"].dt.dayofweek
+    df["is_daytime"]  = ((df["hour"] >= 6) & (df["hour"] <= 19)).astype(float)
+    df["hour_sin"]    = np.sin(2 * np.pi * df["hour"] / 24)
+    df["hour_cos"]    = np.cos(2 * np.pi * df["hour"] / 24)
+    df["month_sin"]   = np.sin(2 * np.pi * df["month"] / 12)
+    df["month_cos"]   = np.cos(2 * np.pi * df["month"] / 12)
+
+    df["temp_in"]  = pd.to_numeric(df["temp_in"],  errors="coerce").fillna(20.0)
+    df["temp_out"] = pd.to_numeric(df["temp_out"], errors="coerce").fillna(15.0)
+    df["temp_diff"] = df["temp_in"] - df["temp_out"]
+
+    for col in LAG_COLS_RAW:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+        for lag in range(1, 4):
+            df[f"{col}_lag{lag}"] = df[col].shift(lag)
+
+    df["next_co2_in"] = df["co2_in"].shift(-3)
+    df = df.dropna(subset=FEATURE_COLS + [TARGET_COL]).reset_index(drop=True)
+    log.info(f"피처 엔지니어링 완료: {len(df):,}행 / {len(FEATURE_COLS)}개 피처")
+    return df
+
+
 def run_retrain(db1: Client, trigger_reason: str = "manual") -> lgb.LGBMRegressor | None:
     """
     10강: DB1 최신 데이터 재학습 → 기존 Production 모델과 성능 비교

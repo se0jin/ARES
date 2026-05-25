@@ -472,6 +472,12 @@ def run_monitoring(db2: Client, db3: Client,
 
     merged = pd.merge(pred_df, actual_df, on="datetime", how="inner")
     if len(merged) < 5:
+        # datetime 정확 매칭 실패 시 시간 단위로 truncate해서 재시도
+        pred_df["dt_hour"]   = pd.to_datetime(pred_df["datetime"],   utc=True).dt.floor("h")
+        actual_df["dt_hour"] = pd.to_datetime(actual_df["datetime"], utc=True).dt.floor("h")
+        merged = pd.merge(pred_df, actual_df, on="dt_hour", how="inner")
+        log.info(f"datetime truncate 매칭으로 재시도: {len(merged)}개")
+    if len(merged) < 5:
         log.warning(f"모니터링: 매칭 행 부족 ({len(merged)}개)")
         return None
 
@@ -560,9 +566,11 @@ def run_monitoring(db2: Client, db3: Client,
         send_discord_alert(alert_msg)
 
     if drift_detected:
+        ks_pval = ks_result['ks_pvalue']
+        ks_pval_str = f"{ks_pval:.4f}" if ks_pval is not None else "N/A"
         drift_msg = (
             f"⚠️ [스마트팜 데이터 드리프트 감지]\n"
-            f"KS p-value={ks_result['ks_pvalue']:.4f} | Evidently={evidently_drift}\n"
+            f"KS p-value={ks_pval_str} | Evidently={evidently_drift}\n"
             f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
             f"→ 재학습 트리거 발동"
         )

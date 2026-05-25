@@ -457,12 +457,13 @@ def run_monitoring(db2: Client, db3: Client,
         log.warning("모니터링: DB2 예측값 없음")
         return None
 
-    # DB3 실제값
-    dt_list = pred_df["datetime"].tolist()
+    # DB3 실제값 — 최근 RETRAIN_WINDOW개 조회
     res3 = (
         db3.table("sensor_data_3")
         .select("datetime, co2_in")
-        .in_("datetime", dt_list)
+        .not_.is_("co2_in", "null")
+        .order("datetime", desc=True)
+        .limit(RETRAIN_WINDOW * 2)
         .execute()
     )
     actual_df = pd.DataFrame(res3.data)

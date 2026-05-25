@@ -474,8 +474,10 @@ def run_monitoring(db2: Client, db3: Client,
         .dt.floor("h")
     )
 
-    # ── [핵심 수정] t 시점 예측 → t+1h 시점 실제값 매칭 ──────────
-    pred_df["dt_match"] = pred_df["dt_hour"] + pd.Timedelta(hours=1)
+    # ── [핵심] t 시점 예측 → t+3h 시점 실제값 매칭 ──────────────
+    # 모델 타겟: next_co2_in = shift(-3) → 3시간 후 CO2 예측
+    # co2_predicted(t) 는 (t+3h) 시점의 co2_in 과 비교해야 정확함
+    pred_df["dt_match"] = pred_df["dt_hour"] + pd.Timedelta(hours=3)
 
     merged = pd.merge(
         pred_df[["dt_match", "co2_predicted"]],
@@ -484,12 +486,12 @@ def run_monitoring(db2: Client, db3: Client,
         right_on="dt_hour",
         how="inner",
     )
-    log.info(f"datetime 시프트 매칭 (t → t+1h): {len(merged)}개 매칭")
+    log.info(f"datetime 시프트 매칭 (t → t+3h): {len(merged)}개 매칭")
 
     if len(merged) < 5:
         log.warning(
             f"모니터링: 매칭 행 부족 ({len(merged)}개) "
-            f"— DB3 실시간 데이터가 충분히 쌓일 때까지 대기"
+            f"— DB3 실시간 데이터가 3시간 이상 쌓일 때까지 대기"
         )
         return None
 
@@ -629,8 +631,8 @@ def build_train_features(raw_df: pd.DataFrame) -> pd.DataFrame:
         for lag in range(1, 4):
             df[f"{col}_lag{lag}"] = df[col].shift(lag)
 
-    # 타겟: 1시간 후 CO2 (파일명 lgbm_co2_1h.pkl 기준)
-    df["next_co2_in"] = df["co2_in"].shift(-1)
+    # 타겟: 3시간 후 CO2 (학습 시 shift(-3) 사용 — 모델과 동일하게 맞춤)
+    df["next_co2_in"] = df["co2_in"].shift(-3)
 
     df = df.dropna(subset=FEATURE_COLS + [TARGET_COL]).reset_index(drop=True)
     log.info(f"피처 엔지니어링 완료: {len(df):,}행 / {len(FEATURE_COLS)}개 피처")

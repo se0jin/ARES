@@ -177,8 +177,12 @@ def build_features(target_row: dict, lag_rows: list[dict]) -> pd.DataFrame:
 
     dt = pd.to_datetime(row["datetime"])
 
-    # 파생 피처
-    row["temp_diff"]   = float(row["temp_in"]) - float(row["temp_out"])
+    # 파생 피처 — None 방어 처리
+    temp_in  = float(row.get("temp_in")  or 20.0)
+    temp_out = float(row.get("temp_out") or 15.0)
+    row["temp_in"]   = temp_in
+    row["temp_out"]  = temp_out
+    row["temp_diff"] = temp_in - temp_out
 
     # 시간 피처
     row["hour"]        = dt.hour
@@ -193,14 +197,9 @@ def build_features(target_row: dict, lag_rows: list[dict]) -> pd.DataFrame:
     # lag 피처 (co2 → co2_predicted 재활용)
     for lag_idx, lag_row in enumerate(lag_rows, start=1):
         for col in LAG_COLS_RAW:
-            try:
-                if col == "co2_in":
-                    val = lag_row.get("co2_predicted") or lag_row.get("co2_in")
-                else:
-                    val = lag_row.get(col)
-                row[f"{col}_lag{lag_idx}"] = float(val) if val is not None else np.nan
-            except (TypeError, ValueError):
-                row[f"{col}_lag{lag_idx}"] = np.nan
+            val = (lag_row.get("co2_predicted") or lag_row.get(col)) if col == "co2_in" \
+                  else lag_row.get(col)
+            row[f"{col}_lag{lag_idx}"] = float(val) if val is not None else np.nan
 
     feat_df = pd.DataFrame([{k: row.get(k, np.nan) for k in FEATURE_COLS}])
     if feat_df.isna().sum().sum() > 0:
@@ -258,7 +257,7 @@ def poll_and_predict(db2: Client, model: lgb.LGBMRegressor) -> list[dict]:
 
             db2.table("sensor_data_2").update(
                 {"co2_predicted": round(pred, 2)}
-            ).eq("datetime", dt_str).execute()
+            ).eq("ID", target_row["ID"]).execute()
 
             log.info(f"  [{dt_str}] co2_predicted = {pred:.1f} ppm")
             target_row["co2_predicted"] = pred
@@ -580,45 +579,6 @@ def run_monitoring(db2: Client, db3: Client,
 # ─────────────────────────────────────────────────────────────────────
 # 9. 10강: 자동 재학습 — 4종 트리거 + Production 승격 비교
 # ─────────────────────────────────────────────────────────────────────
-def build_train_features(raw_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    DB1 원본 데이터 → 학습용 피처 엔지니어링
-    (temp_diff, 시간 피처, lag 피처, next_co2_in 생성)
-    """
-    df = raw_df.copy().sort_values("datetime").reset_index(drop=True)
-    df["datetime"] = pd.to_datetime(df["datetime"], format='mixed', utc=True)
-
-    # 시간 피처
-    df["hour"]        = df["datetime"].dt.hour
-    df["month"]       = df["datetime"].dt.month
-    df["day_of_week"] = df["datetime"].dt.dayofweek
-    df["is_daytime"]  = ((df["hour"] >= 6) & (df["hour"] <= 19)).astype(float)
-    df["hour_sin"]    = np.sin(2 * np.pi * df["hour"] / 24)
-    df["hour_cos"]    = np.cos(2 * np.pi * df["hour"] / 24)
-    df["month_sin"]   = np.sin(2 * np.pi * df["month"] / 12)
-    df["month_cos"]   = np.cos(2 * np.pi * df["month"] / 12)
-
-    # 파생 피처
-    df["temp_in"]  = pd.to_numeric(df["temp_in"],  errors="coerce").fillna(20.0)
-    df["temp_out"] = pd.to_numeric(df["temp_out"], errors="coerce").fillna(15.0)
-    df["temp_diff"] = df["temp_in"] - df["temp_out"]
-
-    # lag 피처
-    for col in LAG_COLS_RAW:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-        for lag in range(1, 4):
-            df[f"{col}_lag{lag}"] = df[col].shift(lag)
-
-    # next_co2_in (타겟) — 3시간 후 값
-    df["next_co2_in"] = df["co2_in"].shift(-3)
-
-    # 앞뒤 NaN 제거
-    df = df.dropna(subset=FEATURE_COLS + [TARGET_COL]).reset_index(drop=True)
-
-    log.info(f"피처 엔지니어링 완료: {len(df):,}행 / {len(FEATURE_COLS)}개 피처")
-    return df
-
-
 def run_retrain(db1: Client, trigger_reason: str = "manual") -> lgb.LGBMRegressor | None:
     """
     10강: DB1 최신 데이터 재학습 → 기존 Production 모델과 성능 비교
@@ -629,31 +589,22 @@ def run_retrain(db1: Client, trigger_reason: str = "manual") -> lgb.LGBMRegresso
     log.info(f"=== [재학습 시작] 트리거: {trigger_reason} ===")
 
     try:
-        # DB1 전체 데이터 로드 (Supabase 1000행 limit 우회 → 페이지네이션)
-        all_data = []
-        offset = 0
-        batch = 1000
-        while True:
-            res = db1.table("sensor_data").select("*").order("datetime").range(offset, offset + batch - 1).execute()
-            if not res.data:
-                break
-            all_data.extend(res.data)
-            if len(res.data) < batch:
-                break
-            offset += batch
-        raw_df = pd.DataFrame(all_data)
+        # DB1 전체 데이터 로드
+        res = db1.table("sensor_data").select("*").order("datetime").execute()
+        raw_df = pd.DataFrame(res.data)
         log.info(f"DB1 로드: {len(raw_df):,}행")
 
         if len(raw_df) < RETRAIN_DATA_MIN_ROWS:
             log.warning(f"재학습 데이터 부족 ({len(raw_df)} < {RETRAIN_DATA_MIN_ROWS}행) — 스킵")
             return None
 
-        # DB1 원본 데이터 → 피처 엔지니어링
-        raw_df = build_train_features(raw_df)
-
-        if len(raw_df) < RETRAIN_DATA_MIN_ROWS:
-            log.warning(f"피처 엔지니어링 후 데이터 부족 ({len(raw_df)}행) — 스킵")
+        required = FEATURE_COLS + [TARGET_COL]
+        missing  = [c for c in required if c not in raw_df.columns]
+        if missing:
+            log.error(f"재학습 컬럼 부재: {missing}")
             return None
+
+        raw_df = raw_df.dropna(subset=required).sort_values("datetime").reset_index(drop=True)
         n = len(raw_df)
         train_df = raw_df.iloc[:int(n * 0.70)]
         val_df   = raw_df.iloc[int(n * 0.70):int(n * 0.85)]
@@ -814,14 +765,14 @@ class Pipeline:
         for row in predicted_rows:
             try:
                 ctrl = compute_control(
-                    co2_pred  = float(row.get("co2_predicted", 700)),
-                    temp_in   = float(row.get("temp_in",  20)),
-                    hum_in    = float(row.get("hum_in",   60)),
-                    soil_hum  = float(row.get("soil_hum", 30)),
-                    temp_out  = float(row.get("temp_out", 15)),
-                    rain_out  = float(row.get("rain_out",  0)),
-                    wind_out  = float(row.get("wind_out",  2)),
-                    solar_out = float(row.get("solar_out", 0)),
+                    co2_pred  = float(row.get("co2_predicted") or 700),
+                    temp_in   = float(row.get("temp_in")   or 20),
+                    hum_in    = float(row.get("hum_in")    or 60),
+                    soil_hum  = float(row.get("soil_hum")  or 30),
+                    temp_out  = float(row.get("temp_out")  or 15),
+                    rain_out  = float(row.get("rain_out")  or 0),
+                    wind_out  = float(row.get("wind_out")  or 2),
+                    solar_out = 0.0,
                     hour      = pd.to_datetime(row["datetime"]).hour,
                 )
                 log.info(
@@ -829,13 +780,8 @@ class Pipeline:
                     f"팬={ctrl['fan_on_sec']}s 창문={ctrl['window_on_sec']}s "
                     f"히터={ctrl['heater_on_sec']}s 펌프={ctrl['pump_on_sec']}s"
                 )
-                # DB2 제어 컬럼 업데이트 (컬럼이 존재하는 경우)
-                try:
-                    self.db2.table("sensor_data_2").update(ctrl).eq(
-                        "datetime", row["datetime"]
-                    ).execute()
-                except Exception:
-                    pass
+                # DB2 제어 컬럼 업데이트 생략 (sensor_data_2에 제어 컬럼 없음)
+                pass
             except Exception as e:
                 log.error(f"제어 계산 오류: {e}")
 

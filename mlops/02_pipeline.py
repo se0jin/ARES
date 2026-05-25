@@ -202,9 +202,14 @@ def build_features(target_row: dict, lag_rows: list[dict]) -> pd.DataFrame:
             row[f"{col}_lag{lag_idx}"] = float(val) if val is not None else np.nan
 
     feat_df = pd.DataFrame([{k: row.get(k, np.nan) for k in FEATURE_COLS}])
+
+    # 모든 피처 float 변환 (object 타입 방지)
+    for col in feat_df.columns:
+        feat_df[col] = pd.to_numeric(feat_df[col], errors="coerce")
+
     if feat_df.isna().sum().sum() > 0:
         log.warning("피처 NaN 발생 → ffill/bfill 처리")
-        feat_df = feat_df.ffill().bfill()
+        feat_df = feat_df.ffill().bfill().infer_objects()
 
     return feat_df
 
@@ -472,8 +477,8 @@ def run_monitoring(db2: Client, db3: Client,
         return None
 
     # datetime을 시간 단위로 truncate해서 매칭 (초/마이크로초 차이 무시)
-    pred_df["dt_hour"]   = pd.to_datetime(pred_df["datetime"],   utc=True).dt.floor("h")
-    actual_df["dt_hour"] = pd.to_datetime(actual_df["datetime"], utc=True).dt.floor("h")
+    pred_df["dt_hour"]   = pd.to_datetime(pred_df["datetime"],   format='mixed', utc=True).dt.floor("h")
+    actual_df["dt_hour"] = pd.to_datetime(actual_df["datetime"], format='mixed', utc=True).dt.floor("h")
     merged = pd.merge(pred_df, actual_df, on="dt_hour", how="inner")
     log.info(f"datetime truncate 매칭: {len(merged)}개")
 

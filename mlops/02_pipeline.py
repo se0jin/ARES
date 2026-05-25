@@ -11,15 +11,15 @@
   09강  Discord Webhook 실시간 경고, Evidently AI 드리프트
   10강  KS Test 드리프트 탐지, 재학습 트리거 4종, Production 승격 비교
 
-[수정 이력 v2.0]
-  ✅ run_monitoring(): co2_predicted(t) → co2_in(t+1h) 시프트 매칭 수정
-     (기존: 같은 시간끼리 매칭 → R²=-0.48 / 수정: t+1h shift → 정상 작동)
-  ✅ DB3_TABLE_NAME = "CO2_in" 상수로 명시
-  ✅ RETRAIN_R2_THRESHOLD = 0.70 (모델 실제 Test R²=0.73 기준으로 조정)
-  ✅ DISCORD_R2_THRESHOLD = 0.60 (경고 기준 현실화)
-  ✅ 재학습 후 ref_co2 갱신 추가
-  ✅ build_train_features(): solar_out/rain_out/wind_out 컬럼 없어도 동작
-  ✅ MODEL_PATH.parent.mkdir 추가 (경로 없어도 자동 생성)
+[수정 이력 v2.1]
+  ✅ run_monitoring(): co2_predicted(t) → co2_in(t+3h) 시프트 매칭
+     (모델 타겟 shift(-3) = 3시간 후 예측이므로 +3h 매칭이 올바름)
+  ✅ DB3_TABLE_NAME = "sensor_data_3" (실제 Supabase 테이블명 반영)
+  ✅ RETRAIN_R2_THRESHOLD = 0.70 / DISCORD_R2_THRESHOLD = 0.60
+  ✅ run_retrain(): 전처리 CSV 우선 사용 → DB1 원본은 CSV 없을 때만
+     (DB1 원본 shift(-3) 시 datetime 비연속 구간에서 R2≈0 버그 수정)
+  ✅ build_train_features(): 선택적 컬럼 방어 처리
+  ✅ MODEL_PATH.parent.mkdir / 재학습 후 ref_co2 갱신
 """
 
 # ─────────────────────────────────────────────────────────────────────
@@ -641,49 +641,83 @@ def build_train_features(raw_df: pd.DataFrame) -> pd.DataFrame:
 
 def run_retrain(db1: Client, trigger_reason: str = "manual") -> lgb.LGBMRegressor | None:
     """
-    10강: DB1 최신 데이터 재학습 → 기존 Production 모델과 성능 비교
-          성능 향상 시 Model Registry Production 승격 → Discord 알림
+    10강: 재학습 → 기존 Production 모델과 성능 비교 → 성능 향상 시 Production 승격
+
+    데이터 소스 우선순위:
+      1순위: 전처리 완료 CSV (train.csv / val.csv / test.csv) — 정확한 피처/타겟 보장
+      2순위: DB1 원본 데이터 — CSV 없을 때만 사용 (datetime 연속성 검증 포함)
+
+    ※ DB1 원본에서 shift(-3)으로 타겟 생성 시 datetime 비연속 구간이 있으면
+       전혀 다른 날짜의 CO2와 엮여 R²≈0 이 되는 문제 → CSV 우선 사용
     """
     log.info(f"=== [재학습 시작] 트리거: {trigger_reason} ===")
 
     try:
-        # ── DB1 전체 데이터 로드 (페이지네이션) ─────────────────
-        all_data = []
-        offset   = 0
-        batch    = 1000
-        while True:
-            res = (
-                db1.table("sensor_data")
-                .select("*")
-                .order("datetime")
-                .range(offset, offset + batch - 1)
-                .execute()
-            )
-            if not res.data:
+        # ── 1순위: 전처리 완료 CSV 로드 ──────────────────────────
+        csv_candidates = [
+            (Path("./data/train.csv"), Path("./data/val.csv"), Path("./data/test.csv")),
+            (Path("/app/data/train.csv"), Path("/app/data/val.csv"), Path("/app/data/test.csv")),
+            (Path("./train.csv"), Path("./val.csv"), Path("./test.csv")),
+        ]
+
+        train_df = val_df = test_df = None
+        for tr_p, va_p, te_p in csv_candidates:
+            if tr_p.exists() and va_p.exists() and te_p.exists():
+                train_df = pd.read_csv(tr_p)
+                val_df   = pd.read_csv(va_p)
+                test_df  = pd.read_csv(te_p)
+                log.info(
+                    f"전처리 CSV 로드 완료: "
+                    f"train={len(train_df):,} / val={len(val_df):,} / test={len(test_df):,}행"
+                )
                 break
-            all_data.extend(res.data)
-            if len(res.data) < batch:
-                break
-            offset += batch
 
-        raw_df = pd.DataFrame(all_data)
-        log.info(f"DB1 로드: {len(raw_df):,}행")
+        if train_df is None:
+            # ── 2순위: DB1 원본 데이터 (CSV 없을 때만) ───────────
+            log.info("전처리 CSV 없음 — DB1 원본 데이터 사용")
+            all_data = []
+            offset   = 0
+            batch    = 1000
+            while True:
+                res = (
+                    db1.table("sensor_data")
+                    .select("*")
+                    .order("datetime")
+                    .range(offset, offset + batch - 1)
+                    .execute()
+                )
+                if not res.data:
+                    break
+                all_data.extend(res.data)
+                if len(res.data) < batch:
+                    break
+                offset += batch
 
-        if len(raw_df) < RETRAIN_DATA_MIN_ROWS:
-            log.warning(f"재학습 데이터 부족 ({len(raw_df)} < {RETRAIN_DATA_MIN_ROWS}행) — 스킵")
-            return None
+            raw_df = pd.DataFrame(all_data)
+            log.info(f"DB1 로드: {len(raw_df):,}행")
 
-        raw_df = build_train_features(raw_df)
+            if len(raw_df) < RETRAIN_DATA_MIN_ROWS:
+                log.warning(f"재학습 데이터 부족 ({len(raw_df)} < {RETRAIN_DATA_MIN_ROWS}행) — 스킵")
+                return None
 
-        if len(raw_df) < RETRAIN_DATA_MIN_ROWS:
-            log.warning(f"피처 엔지니어링 후 데이터 부족 ({len(raw_df)}행) — 스킵")
-            return None
+            # datetime 연속성 검증 — 비연속 구간에서 shift(-3) 오류 방지
+            raw_df["datetime"] = pd.to_datetime(raw_df["datetime"], format="mixed", utc=True)
+            raw_df = raw_df.sort_values("datetime").reset_index(drop=True)
+            time_diffs = raw_df["datetime"].diff().dt.total_seconds() / 3600
+            gap_count = (time_diffs > 2).sum()
+            if gap_count > 0:
+                log.warning(f"datetime 비연속 구간 {gap_count}개 감지 — dropna로 타겟 오염 방지")
 
-        # ── 시간순 분할 ──────────────────────────────────────────
-        n        = len(raw_df)
-        train_df = raw_df.iloc[:int(n * 0.70)]
-        val_df   = raw_df.iloc[int(n * 0.70):int(n * 0.85)]
-        test_df  = raw_df.iloc[int(n * 0.85):]
+            raw_df = build_train_features(raw_df)
+
+            if len(raw_df) < RETRAIN_DATA_MIN_ROWS:
+                log.warning(f"피처 엔지니어링 후 데이터 부족 ({len(raw_df)}행) — 스킵")
+                return None
+
+            n        = len(raw_df)
+            train_df = raw_df.iloc[:int(n * 0.70)]
+            val_df   = raw_df.iloc[int(n * 0.70):int(n * 0.85)]
+            test_df  = raw_df.iloc[int(n * 0.85):]
 
         X_tr, y_tr = train_df[FEATURE_COLS], train_df[TARGET_COL]
         X_va, y_va = val_df[FEATURE_COLS],   val_df[TARGET_COL]

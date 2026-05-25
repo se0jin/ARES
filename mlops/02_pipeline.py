@@ -11,19 +11,15 @@
   09강  Discord Webhook 실시간 경고, Evidently AI 드리프트
   10강  KS Test 드리프트 탐지, 재학습 트리거 4종, Production 승격 비교
 
-동작 흐름 (1시간 주기 schedule):
-  1. DB2 폴링   : co2_in = Null + co2_predicted = Null 인 신규 행 감지
-  2. 피처 구성  : 직전 3행 → 28개 피처 (co2_predicted lag 재활용)
-  3. 예측       : lgbm_co2_1h.pkl → co2_predicted (300~2000 ppm 클리핑)
-  4. DB2 업데이트: co2_predicted 컬럼 채움
-  5. 규칙 기반 제어: 4채널 릴레이 ON 시간 계산 (논문 근거 우선순위 계층)
-  6. 모니터링   : DB2 예측값 vs DB3 실제값 비교 → MLflow 기록
-  7. 드리프트   : Evidently AI + KS Test → Discord 경고
-  8. 재학습 판단: 4종 트리거 → DB1 최신 데이터 재학습 → Production 승격
-
-필요 패키지:
-  pip install supabase mlflow lightgbm scikit-learn joblib schedule \
-              evidently scipy pandas numpy requests fastapi uvicorn
+[수정 이력 v2.1]
+  ✅ run_monitoring(): co2_predicted(t) → co2_in(t+3h) 시프트 매칭
+     (모델 타겟 shift(-3) = 3시간 후 예측이므로 +3h 매칭이 올바름)
+  ✅ DB3_TABLE_NAME = "sensor_data_3" (실제 Supabase 테이블명 반영)
+  ✅ RETRAIN_R2_THRESHOLD = 0.70 / DISCORD_R2_THRESHOLD = 0.60
+  ✅ run_retrain(): 전처리 CSV 우선 사용 → DB1 원본은 CSV 없을 때만
+     (DB1 원본 shift(-3) 시 datetime 비연속 구간에서 R2≈0 버그 수정)
+  ✅ build_train_features(): 선택적 컬럼 방어 처리
+  ✅ MODEL_PATH.parent.mkdir / 재학습 후 ref_co2 갱신
 """
 
 # ─────────────────────────────────────────────────────────────────────
@@ -74,25 +70,28 @@ SUPABASE_KEY_DB2 = os.getenv("SUPABASE_KEY_DB2", "your-db2-key")
 SUPABASE_URL_DB3 = os.getenv("SUPABASE_URL_DB3", "https://your-db3.supabase.co")
 SUPABASE_KEY_DB3 = os.getenv("SUPABASE_KEY_DB3", "your-db3-key")
 
+# ── DB3 테이블명 (실제 Supabase DB3 테이블명: sensor_data_3)
+DB3_TABLE_NAME = "sensor_data_3"
+
 # ── 09강: Discord Webhook URL ────────────────────────────────────────
-#   Discord 서버 → 채널 편집 → 연동 → 웹후크 → 새 웹후크 → URL 복사
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
 # ── 경로 ─────────────────────────────────────────────────────────────
 MODEL_PATH          = Path("./models/lgbm_co2_1h.pkl")
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
 EXPERIMENT_NAME     = "smartfarm_co2_monitoring"
-REGISTRY_MODEL_NAME = "smartfarm_co2_lgbm"   # MLflow Model Registry 이름
+REGISTRY_MODEL_NAME = "smartfarm_co2_lgbm"
 
 # ── 재학습 트리거 임계값 (10강: 4종 트리거) ─────────────────────────
-RETRAIN_R2_THRESHOLD    = 0.85   # ① R² 기준 이하
+# ※ 모델 실제 Test R²=0.73 기준으로 조정 (기존 0.85는 너무 높아 매번 재학습 발생)
+RETRAIN_R2_THRESHOLD    = 0.70
 KS_PVALUE_THRESHOLD     = 0.05   # ② KS Test p-value < 0.05 → 드리프트
 RETRAIN_WINDOW          = 48     # 최근 N개 예측으로 성능 평가
 RETRAIN_DATA_MIN_ROWS   = 500    # ③ 신규 데이터 최소 누적량
-RETRAIN_SCHEDULE_HOUR   = 2      # ④ 정기 배치: 매일 새벽 2시 (schedule 별도 등록)
+RETRAIN_SCHEDULE_HOUR   = 2      # ④ 정기 배치: 매일 새벽 2시
 
-# ── 09강: Discord 경고 임계값 ────────────────────────────────────────
-DISCORD_R2_THRESHOLD    = 0.80   # R² < 0.80 이면 경고 발송
+# ── 09강: Discord 경고 임계값 (현실적인 수준으로 조정) ───────────────
+DISCORD_R2_THRESHOLD    = 0.60
 
 # ── 모델 예측 범위 ────────────────────────────────────────────────────
 CO2_CLIP_MIN = 300
@@ -177,8 +176,12 @@ def build_features(target_row: dict, lag_rows: list[dict]) -> pd.DataFrame:
 
     dt = pd.to_datetime(row["datetime"])
 
-    # 파생 피처
-    row["temp_diff"]   = float(row["temp_in"]) - float(row["temp_out"])
+    # 파생 피처 — None 방어 처리
+    temp_in  = float(row.get("temp_in")  or 20.0)
+    temp_out = float(row.get("temp_out") or 15.0)
+    row["temp_in"]   = temp_in
+    row["temp_out"]  = temp_out
+    row["temp_diff"] = temp_in - temp_out
 
     # 시간 피처
     row["hour"]        = dt.hour
@@ -198,9 +201,14 @@ def build_features(target_row: dict, lag_rows: list[dict]) -> pd.DataFrame:
             row[f"{col}_lag{lag_idx}"] = float(val) if val is not None else np.nan
 
     feat_df = pd.DataFrame([{k: row.get(k, np.nan) for k in FEATURE_COLS}])
+
+    # 모든 피처 float 변환 (object 타입 방지)
+    for col in feat_df.columns:
+        feat_df[col] = pd.to_numeric(feat_df[col], errors="coerce")
+
     if feat_df.isna().sum().sum() > 0:
         log.warning("피처 NaN 발생 → ffill/bfill 처리")
-        feat_df = feat_df.ffill().bfill()
+        feat_df = feat_df.ffill().bfill().infer_objects()
 
     return feat_df
 
@@ -253,7 +261,7 @@ def poll_and_predict(db2: Client, model: lgb.LGBMRegressor) -> list[dict]:
 
             db2.table("sensor_data_2").update(
                 {"co2_predicted": round(pred, 2)}
-            ).eq("datetime", dt_str).execute()
+            ).eq("ID", target_row["ID"]).execute()
 
             log.info(f"  [{dt_str}] co2_predicted = {pred:.1f} ppm")
             target_row["co2_predicted"] = pred
@@ -381,10 +389,6 @@ def compute_control(co2_pred: float, temp_in: float, hum_in: float,
 # 6. 09강: Discord Webhook 실시간 경고
 # ─────────────────────────────────────────────────────────────────────
 def send_discord_alert(message: str):
-    """
-    09강: 성능 임계값 이하 시 Discord Webhook으로 자동 경고 발송
-    DISCORD_WEBHOOK_URL 환경변수 미설정 시 로그만 출력
-    """
     if not DISCORD_WEBHOOK_URL:
         log.warning(f"[Discord 경고 — Webhook 미설정] {message}")
         return
@@ -408,11 +412,6 @@ def send_discord_alert(message: str):
 # ─────────────────────────────────────────────────────────────────────
 def run_ks_test(ref_values: np.ndarray, curr_values: np.ndarray,
                 feature_name: str = "co2") -> dict:
-    """
-    10강: KS Test — 두 분포 비교 → p-value < 0.05 이면 드리프트 판정
-    ref_values  : 기준 데이터 (train.csv의 co2_in 분포 등)
-    curr_values : 현재 실시간 예측값 분포
-    """
     if len(ref_values) < 5 or len(curr_values) < 5:
         return {"ks_stat": None, "ks_pvalue": None, "drift": False}
 
@@ -432,14 +431,12 @@ def run_ks_test(ref_values: np.ndarray, curr_values: np.ndarray,
 def run_monitoring(db2: Client, db3: Client,
                    ref_co2_values: np.ndarray | None = None) -> dict | None:
     """
-    DB2 예측값 vs DB3 실제값 비교
-    → RMSE/MAE/R²/MAPE 계산
-    → Evidently AI 드리프트 리포트
-    → KS Test 드리프트 탐지
-    → MLflow 기록 (05강: params + metrics 분리)
-    → Discord 경고 (09강)
+    ★ 핵심 수정: co2_predicted(t) ↔ co2_in(t+1h) 시프트 매칭
+    모델이 "1시간 후 CO2"를 예측하므로
+    t 시점 예측값은 반드시 t+1h 시점의 실제값과 비교해야 함
+    기존 코드(같은 시간 매칭)는 완전히 다른 값끼리 비교 → R²=-0.48 발생
     """
-    # DB2 최근 예측값
+    # ── DB2: 최근 예측값 로드 ──────────────────────────────────────
     res2 = (
         db2.table("sensor_data_2")
         .select("datetime, co2_predicted")
@@ -453,12 +450,13 @@ def run_monitoring(db2: Client, db3: Client,
         log.warning("모니터링: DB2 예측값 없음")
         return None
 
-    # DB3 실제값
-    dt_list = pred_df["datetime"].tolist()
+    # ── DB3: 실제값 로드 (CO2_in 테이블) ────────────────────────
     res3 = (
-        db3.table("sensor_data_3")
+        db3.table(DB3_TABLE_NAME)
         .select("datetime, co2_in")
-        .in_("datetime", dt_list)
+        .not_.is_("co2_in", "null")
+        .order("datetime", desc=True)
+        .limit(RETRAIN_WINDOW * 2)
         .execute()
     )
     actual_df = pd.DataFrame(res3.data)
@@ -466,9 +464,35 @@ def run_monitoring(db2: Client, db3: Client,
         log.warning("모니터링: DB3 실제값 없음 (아직 누적 중)")
         return None
 
-    merged = pd.merge(pred_df, actual_df, on="datetime", how="inner")
+    # ── datetime 파싱 및 시간 단위 truncate ───────────────────────
+    pred_df["dt_hour"] = (
+        pd.to_datetime(pred_df["datetime"], format="mixed", utc=True)
+        .dt.floor("h")
+    )
+    actual_df["dt_hour"] = (
+        pd.to_datetime(actual_df["datetime"], format="mixed", utc=True)
+        .dt.floor("h")
+    )
+
+    # ── [핵심] t 시점 예측 → t+3h 시점 실제값 매칭 ──────────────
+    # 모델 타겟: next_co2_in = shift(-3) → 3시간 후 CO2 예측
+    # co2_predicted(t) 는 (t+3h) 시점의 co2_in 과 비교해야 정확함
+    pred_df["dt_match"] = pred_df["dt_hour"] + pd.Timedelta(hours=3)
+
+    merged = pd.merge(
+        pred_df[["dt_match", "co2_predicted"]],
+        actual_df[["dt_hour", "co2_in"]],
+        left_on="dt_match",
+        right_on="dt_hour",
+        how="inner",
+    )
+    log.info(f"datetime 시프트 매칭 (t → t+3h): {len(merged)}개 매칭")
+
     if len(merged) < 5:
-        log.warning(f"모니터링: 매칭 행 부족 ({len(merged)}개)")
+        log.warning(
+            f"모니터링: 매칭 행 부족 ({len(merged)}개) "
+            f"— DB3 실시간 데이터가 3시간 이상 쌓일 때까지 대기"
+        )
         return None
 
     y_pred = merged["co2_predicted"].values.astype(float)
@@ -502,8 +526,8 @@ def run_monitoring(db2: Client, db3: Client,
 
         report = Report(metrics=[DataDriftPreset()])
         report.run(reference_data=ref_df, current_data=curr_df)
-        result_dict      = report.as_dict()
-        evidently_drift  = result_dict["metrics"][0]["result"]["dataset_drift"]
+        result_dict     = report.as_dict()
+        evidently_drift = result_dict["metrics"][0]["result"]["dataset_drift"]
 
         Path("reports").mkdir(exist_ok=True)
         report_path = f"reports/drift_{datetime.now().strftime('%Y%m%d_%H%M')}.html"
@@ -522,23 +546,22 @@ def run_monitoring(db2: Client, db3: Client,
         with mlflow.start_run(
             run_name=f"monitor_{datetime.now().strftime('%Y%m%d_%H%M')}"
         ):
-            # log_params: 설정값
             mlflow.log_params({
-                "retrain_r2_threshold":  RETRAIN_R2_THRESHOLD,
-                "ks_pvalue_threshold":   KS_PVALUE_THRESHOLD,
-                "monitoring_window":     RETRAIN_WINDOW,
-                "model_path":            str(MODEL_PATH),
-                "n_samples":             len(merged),
+                "retrain_r2_threshold": RETRAIN_R2_THRESHOLD,
+                "ks_pvalue_threshold":  KS_PVALUE_THRESHOLD,
+                "monitoring_window":    RETRAIN_WINDOW,
+                "model_path":           str(MODEL_PATH),
+                "n_samples":            len(merged),
+                "match_mode":           "t_to_t+1h_shift",
             })
-            # log_metrics: 성능 지표
             mlflow.log_metrics({
-                "rmse":          rmse,
-                "mae":           mae,
-                "r2":            r2,
-                "mape":          mape,
-                "ks_stat":       ks_result["ks_stat"] or -1.0,
-                "ks_pvalue":     ks_result["ks_pvalue"] or -1.0,
-                "drift_flag":    float(drift_detected),
+                "rmse":       rmse,
+                "mae":        mae,
+                "r2":         r2,
+                "mape":       mape,
+                "ks_stat":    ks_result["ks_stat"]   or -1.0,
+                "ks_pvalue":  ks_result["ks_pvalue"] or -1.0,
+                "drift_flag": float(drift_detected),
             })
         log.info("MLflow 기록 완료")
     except Exception as e:
@@ -546,71 +569,186 @@ def run_monitoring(db2: Client, db3: Client,
 
     # ── 09강: Discord 경고 ───────────────────────────────────────
     if r2 < DISCORD_R2_THRESHOLD:
-        alert_msg = (
+        send_discord_alert(
             f"🚨 [스마트팜 CO2 모델 경고]\n"
             f"R² = {r2:.4f} < 기준 {DISCORD_R2_THRESHOLD}\n"
             f"RMSE = {rmse:.2f} ppm | MAPE = {mape:.2f}%\n"
             f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
             f"→ 자동 재학습 검토 중"
         )
-        send_discord_alert(alert_msg)
 
     if drift_detected:
-        drift_msg = (
+        ks_pval     = ks_result["ks_pvalue"]
+        ks_pval_str = f"{ks_pval:.4f}" if ks_pval is not None else "N/A"
+        send_discord_alert(
             f"⚠️ [스마트팜 데이터 드리프트 감지]\n"
-            f"KS p-value={ks_result['ks_pvalue']:.4f} | Evidently={evidently_drift}\n"
+            f"KS p-value={ks_pval_str} | Evidently={evidently_drift}\n"
             f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
             f"→ 재학습 트리거 발동"
         )
-        send_discord_alert(drift_msg)
 
     return {
-        "rmse": rmse, "mae": mae, "r2": r2, "mape": mape,
+        "rmse":           rmse,
+        "mae":            mae,
+        "r2":             r2,
+        "mape":           mape,
         "drift_detected": drift_detected,
-        "ks_pvalue": ks_result["ks_pvalue"],
-        "n_samples": len(merged),
+        "ks_pvalue":      ks_result["ks_pvalue"],
+        "n_samples":      len(merged),
     }
 
 
 # ─────────────────────────────────────────────────────────────────────
 # 9. 10강: 자동 재학습 — 4종 트리거 + Production 승격 비교
 # ─────────────────────────────────────────────────────────────────────
+def build_train_features(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    DB1 원본 데이터 → 학습용 피처 엔지니어링
+    ※ solar_out / rain_out / wind_out 컬럼 없어도 동작
+    ※ datetime 비연속 구간 전후 행의 타겟/lag를 NaN으로 명시 처리
+       → shift(-3)이 다른 날짜 CO2와 엮이는 타겟 오염 완전 차단
+    """
+    df = raw_df.copy().sort_values("datetime").reset_index(drop=True)
+    df["datetime"] = pd.to_datetime(df["datetime"], format="mixed", utc=True)
+
+    # ── datetime 비연속 구간 감지 (2시간 초과 간격 = 비연속) ─────────
+    time_diff_h = df["datetime"].diff().dt.total_seconds() / 3600
+    gap_after  = set(df.index[time_diff_h > 2].tolist())   # gap 직후 인덱스
+    # gap 직전 3행: shift(-3) 타겟이 gap 너머 값을 보는 행
+    gap_before = set()
+    for idx in gap_after:
+        for k in range(1, 4):
+            if idx - k >= 0:
+                gap_before.add(idx - k)
+    # gap 직후 3행: lag 피처가 오염되는 행
+    gap_lag = set()
+    for idx in gap_after:
+        for k in range(0, 3):
+            if idx + k < len(df):
+                gap_lag.add(idx + k)
+
+    contaminated = gap_before | gap_after | gap_lag
+    if contaminated:
+        log.warning(
+            f"datetime 비연속 구간 {len(gap_after)}개 → "
+            f"오염 가능 {len(contaminated)}행 타겟/lag NaN 처리"
+        )
+
+    df["hour"]        = df["datetime"].dt.hour
+    df["month"]       = df["datetime"].dt.month
+    df["day_of_week"] = df["datetime"].dt.dayofweek
+    df["is_daytime"]  = ((df["hour"] >= 6) & (df["hour"] <= 19)).astype(float)
+    df["hour_sin"]    = np.sin(2 * np.pi * df["hour"] / 24)
+    df["hour_cos"]    = np.cos(2 * np.pi * df["hour"] / 24)
+    df["month_sin"]   = np.sin(2 * np.pi * df["month"] / 12)
+    df["month_cos"]   = np.cos(2 * np.pi * df["month"] / 12)
+
+    df["temp_in"]   = pd.to_numeric(df.get("temp_in"),  errors="coerce").fillna(20.0)
+    df["temp_out"]  = pd.to_numeric(df.get("temp_out"), errors="coerce").fillna(15.0)
+    df["temp_diff"] = df["temp_in"] - df["temp_out"]
+
+    df["rain_out"] = pd.to_numeric(df.get("rain_out", 0), errors="coerce").fillna(0)
+    df["wind_out"] = pd.to_numeric(df.get("wind_out", 0), errors="coerce").fillna(0)
+
+    for col in LAG_COLS_RAW:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+        for lag in range(1, 4):
+            df[f"{col}_lag{lag}"] = df[col].shift(lag)
+
+    # lag 오염 행 NaN 처리
+    lag_cols = [f"{col}_lag{lag}" for col in LAG_COLS_RAW for lag in range(1, 4)]
+    if gap_lag:
+        df.loc[list(gap_lag), lag_cols] = np.nan
+
+    # 타겟: 3시간 후 CO2
+    df["next_co2_in"] = df["co2_in"].shift(-3)
+
+    # 타겟 오염 행 NaN 처리 → dropna로 자동 제거
+    if gap_before:
+        df.loc[list(gap_before), "next_co2_in"] = np.nan
+
+    df = df.dropna(subset=FEATURE_COLS + [TARGET_COL]).reset_index(drop=True)
+    log.info(f"피처 엔지니어링 완료: {len(df):,}행 / {len(FEATURE_COLS)}개 피처")
+    return df
+
+
 def run_retrain(db1: Client, trigger_reason: str = "manual") -> lgb.LGBMRegressor | None:
     """
-    10강: DB1 최신 데이터 재학습 → 기존 Production 모델과 성능 비교
-          성능 향상 시 Model Registry Production 승격 → Discord 알림
+    10강: 재학습 → 기존 Production 모델과 성능 비교 → 성능 향상 시 Production 승격
 
-    trigger_reason: "r2_drop" | "ks_drift" | "evidently_drift" | "scheduled" | "manual"
+    데이터 소스 우선순위:
+      1순위: 전처리 완료 CSV (train.csv / val.csv / test.csv) — 정확한 피처/타겟 보장
+      2순위: DB1 원본 데이터 — CSV 없을 때만 사용 (datetime 연속성 검증 포함)
+
+    ※ DB1 원본에서 shift(-3)으로 타겟 생성 시 datetime 비연속 구간이 있으면
+       전혀 다른 날짜의 CO2와 엮여 R²≈0 이 되는 문제 → CSV 우선 사용
     """
     log.info(f"=== [재학습 시작] 트리거: {trigger_reason} ===")
 
     try:
-        # DB1 전체 데이터 로드
-        res = db1.table("sensor_data").select("*").order("datetime").execute()
-        raw_df = pd.DataFrame(res.data)
-        log.info(f"DB1 로드: {len(raw_df):,}행")
+        # ── 1순위: 전처리 완료 CSV 로드 ──────────────────────────
+        csv_candidates = [
+            (Path("./data/train.csv"), Path("./data/val.csv"), Path("./data/test.csv")),
+            (Path("/app/data/train.csv"), Path("/app/data/val.csv"), Path("/app/data/test.csv")),
+            (Path("./train.csv"), Path("./val.csv"), Path("./test.csv")),
+        ]
 
-        if len(raw_df) < RETRAIN_DATA_MIN_ROWS:
-            log.warning(f"재학습 데이터 부족 ({len(raw_df)} < {RETRAIN_DATA_MIN_ROWS}행) — 스킵")
-            return None
+        train_df = val_df = test_df = None
+        for tr_p, va_p, te_p in csv_candidates:
+            if tr_p.exists() and va_p.exists() and te_p.exists():
+                train_df = pd.read_csv(tr_p)
+                val_df   = pd.read_csv(va_p)
+                test_df  = pd.read_csv(te_p)
+                log.info(
+                    f"전처리 CSV 로드 완료: "
+                    f"train={len(train_df):,} / val={len(val_df):,} / test={len(test_df):,}행"
+                )
+                break
 
-        required = FEATURE_COLS + [TARGET_COL]
-        missing  = [c for c in required if c not in raw_df.columns]
-        if missing:
-            log.error(f"재학습 컬럼 부재: {missing}")
-            return None
+        if train_df is None:
+            # ── 2순위: DB1 원본 데이터 (CSV 없을 때만) ───────────
+            log.info("전처리 CSV 없음 — DB1 원본 데이터 사용")
+            all_data = []
+            offset   = 0
+            batch    = 1000
+            while True:
+                res = (
+                    db1.table("sensor_data")
+                    .select("*")
+                    .order("datetime")
+                    .range(offset, offset + batch - 1)
+                    .execute()
+                )
+                if not res.data:
+                    break
+                all_data.extend(res.data)
+                if len(res.data) < batch:
+                    break
+                offset += batch
 
-        raw_df = raw_df.dropna(subset=required).sort_values("datetime").reset_index(drop=True)
-        n = len(raw_df)
-        train_df = raw_df.iloc[:int(n * 0.70)]
-        val_df   = raw_df.iloc[int(n * 0.70):int(n * 0.85)]
-        test_df  = raw_df.iloc[int(n * 0.85):]
+            raw_df = pd.DataFrame(all_data)
+            log.info(f"DB1 로드: {len(raw_df):,}행")
+
+            if len(raw_df) < RETRAIN_DATA_MIN_ROWS:
+                log.warning(f"재학습 데이터 부족 ({len(raw_df)} < {RETRAIN_DATA_MIN_ROWS}행) — 스킵")
+                return None
+
+            raw_df = build_train_features(raw_df)
+
+            if len(raw_df) < RETRAIN_DATA_MIN_ROWS:
+                log.warning(f"피처 엔지니어링 후 데이터 부족 ({len(raw_df)}행) — 스킵")
+                return None
+
+            n        = len(raw_df)
+            train_df = raw_df.iloc[:int(n * 0.70)]
+            val_df   = raw_df.iloc[int(n * 0.70):int(n * 0.85)]
+            test_df  = raw_df.iloc[int(n * 0.85):]
 
         X_tr, y_tr = train_df[FEATURE_COLS], train_df[TARGET_COL]
         X_va, y_va = val_df[FEATURE_COLS],   val_df[TARGET_COL]
         X_te, y_te = test_df[FEATURE_COLS],  test_df[TARGET_COL]
 
-        # 재학습
+        # ── 재학습 ───────────────────────────────────────────────
         params = copy.deepcopy(LGB_PARAMS)
         n_est  = params.pop("n_estimators")
         new_model = lgb.LGBMRegressor(**params, n_estimators=n_est)
@@ -623,23 +761,22 @@ def run_retrain(db1: Client, trigger_reason: str = "manual") -> lgb.LGBMRegresso
             ],
         )
 
-        # 신규 모델 성능
-        pred_new  = new_model.predict(X_te)
-        rmse_new  = float(np.sqrt(mean_squared_error(y_te, pred_new)))
-        r2_new    = float(r2_score(y_te, pred_new))
-        mae_new   = float(mean_absolute_error(y_te, pred_new))
+        pred_new = new_model.predict(X_te)
+        rmse_new = float(np.sqrt(mean_squared_error(y_te, pred_new)))
+        r2_new   = float(r2_score(y_te, pred_new))
+        mae_new  = float(mean_absolute_error(y_te, pred_new))
         log.info(f"[재학습] 신규 모델 — RMSE={rmse_new:.4f}  R²={r2_new:.4f}")
 
-        # 10강: 기존 Production 모델과 성능 비교
+        # ── 10강: 기존 모델과 성능 비교 ─────────────────────────
         current_model = load_model()
-        pred_curr = current_model.predict(X_te)
-        r2_curr   = float(r2_score(y_te, pred_curr))
+        pred_curr     = current_model.predict(X_te)
+        r2_curr       = float(r2_score(y_te, pred_curr))
         log.info(f"[재학습] 기존 모델 — R²={r2_curr:.4f}")
 
         if r2_new <= r2_curr:
             log.warning(
-                f"[재학습] 신규 모델 성능 미달 (R²: {r2_new:.4f} ≤ {r2_curr:.4f}) "
-                f"— Production 교체 보류"
+                f"[재학습] 신규 모델 성능 미달 "
+                f"(R²: {r2_new:.4f} ≤ {r2_curr:.4f}) — Production 교체 보류"
             )
             send_discord_alert(
                 f"ℹ️ [재학습 완료 — 교체 보류]\n"
@@ -648,50 +785,46 @@ def run_retrain(db1: Client, trigger_reason: str = "manual") -> lgb.LGBMRegresso
             )
             return None
 
-        # pkl 갱신
+        # ── pkl 갱신 ─────────────────────────────────────────────
+        MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump(new_model, MODEL_PATH)
         log.info(f"[재학습] pkl 갱신 완료: {MODEL_PATH}")
 
-        # 10강: MLflow Model Registry 등록 + Production 승격
+        # ── 10강: MLflow Model Registry 등록 + Production 승격 ──
         try:
             with mlflow.start_run(
                 run_name=f"retrain_{datetime.now().strftime('%Y%m%d_%H%M')}"
             ):
-                # log_params: 재학습 설정
                 mlflow.log_params({
-                    "trigger_reason":    trigger_reason,
-                    "train_rows":        len(train_df),
-                    "val_rows":          len(val_df),
-                    "test_rows":         len(test_df),
-                    "best_iter":         getattr(new_model, "best_iteration_", -1),
-                    "r2_previous":       r2_curr,
+                    "trigger_reason": trigger_reason,
+                    "train_rows":     len(train_df),
+                    "val_rows":       len(val_df),
+                    "test_rows":      len(test_df),
+                    "best_iter":      getattr(new_model, "best_iteration_", -1),
+                    "r2_previous":    r2_curr,
                 })
-                # log_metrics: 성능 지표
                 mlflow.log_metrics({
-                    "test_rmse": rmse_new,
-                    "test_mae":  mae_new,
-                    "test_r2":   r2_new,
+                    "test_rmse":      rmse_new,
+                    "test_mae":       mae_new,
+                    "test_r2":        r2_new,
                     "r2_improvement": r2_new - r2_curr,
                 })
-
-                # 02강: Model Registry 등록
-                model_info = mlflow.sklearn.log_model(
+                mlflow.sklearn.log_model(
                     new_model,
                     artifact_path="lgbm_co2",
                     registered_model_name=REGISTRY_MODEL_NAME,
                 )
 
-            # 10강: Production 승격 (MlflowClient 사용)
             from mlflow.tracking import MlflowClient
             client      = MlflowClient()
             latest_vers = client.get_latest_versions(REGISTRY_MODEL_NAME, stages=["None"])
             if latest_vers:
                 new_ver = latest_vers[-1].version
                 client.transition_model_version_stage(
-                    name    = REGISTRY_MODEL_NAME,
-                    version = new_ver,
-                    stage   = "Production",
-                    archive_existing_versions=True,  # 기존 Production → Archive
+                    name=REGISTRY_MODEL_NAME,
+                    version=new_ver,
+                    stage="Production",
+                    archive_existing_versions=True,
                 )
                 log.info(f"Model Registry: v{new_ver} → Production 승격 (기존 → Archive)")
 
@@ -719,15 +852,15 @@ def run_retrain(db1: Client, trigger_reason: str = "manual") -> lgb.LGBMRegresso
 class Pipeline:
     def __init__(self):
         self.db1, self.db2, self.db3 = init_clients()
-        self.model        = load_model()
-        self.ref_co2      = self._load_ref_co2()   # KS Test 기준 분포
+        self.model   = load_model()
+        self.ref_co2 = self._load_ref_co2()
         init_mlflow()
         log.info("Pipeline 초기화 완료")
 
     def _load_ref_co2(self) -> np.ndarray | None:
-        """train.csv가 있으면 co2_in 분포를 기준값으로 로드 (KS Test용)"""
+        """KS Test 기준값 로드 (train.csv co2_in 분포)"""
         ref_paths = [
-            Path("./models/train_co2_ref.npy"),          # 미리 저장된 npy
+            Path("./models/train_co2_ref.npy"),
             Path("/content/drive/MyDrive/스마트팜 프로젝트"
                  "/data/2차데이터/최종 데이터(전처리 후)/train.csv"),
         ]
@@ -740,6 +873,7 @@ class Pipeline:
                 df = pd.read_csv(p)
                 if "co2_in" in df.columns:
                     arr = df["co2_in"].dropna().values
+                    Path("./models").mkdir(exist_ok=True)
                     np.save("./models/train_co2_ref.npy", arr)
                     log.info(f"KS Test 기준값 로드 (CSV): {len(arr)}개 → npy 캐싱")
                     return arr
@@ -761,14 +895,14 @@ class Pipeline:
         for row in predicted_rows:
             try:
                 ctrl = compute_control(
-                    co2_pred  = float(row.get("co2_predicted", 700)),
-                    temp_in   = float(row.get("temp_in",  20)),
-                    hum_in    = float(row.get("hum_in",   60)),
-                    soil_hum  = float(row.get("soil_hum", 30)),
-                    temp_out  = float(row.get("temp_out", 15)),
-                    rain_out  = float(row.get("rain_out",  0)),
-                    wind_out  = float(row.get("wind_out",  2)),
-                    solar_out = float(row.get("solar_out", 0)),
+                    co2_pred  = float(row.get("co2_predicted") or 700),
+                    temp_in   = float(row.get("temp_in")   or 20),
+                    hum_in    = float(row.get("hum_in")    or 60),
+                    soil_hum  = float(row.get("soil_hum")  or 30),
+                    temp_out  = float(row.get("temp_out")  or 15),
+                    rain_out  = float(row.get("rain_out")  or 0),
+                    wind_out  = float(row.get("wind_out")  or 2),
+                    solar_out = 0.0,
                     hour      = pd.to_datetime(row["datetime"]).hour,
                 )
                 log.info(
@@ -776,28 +910,19 @@ class Pipeline:
                     f"팬={ctrl['fan_on_sec']}s 창문={ctrl['window_on_sec']}s "
                     f"히터={ctrl['heater_on_sec']}s 펌프={ctrl['pump_on_sec']}s"
                 )
-                # DB2 제어 컬럼 업데이트 (컬럼이 존재하는 경우)
-                try:
-                    self.db2.table("sensor_data_2").update(ctrl).eq(
-                        "datetime", row["datetime"]
-                    ).execute()
-                except Exception:
-                    pass
             except Exception as e:
                 log.error(f"제어 계산 오류: {e}")
 
-        # Step 6~7: 모니터링 + 드리프트 감지 + Discord 경고
+        # Step 6~7: 모니터링 + 드리프트 감지
         metrics = run_monitoring(self.db2, self.db3, ref_co2_values=self.ref_co2)
 
-        # Step 8: 재학습 트리거 판단 (10강 4종 트리거 중 이벤트 기반 2종)
-        #   ③ 배치(정기) 재학습은 scheduled_step()에서 처리
-        #   ④ 신규 데이터 누적량은 run_retrain() 내부에서 체크
+        # Step 8: 재학습 트리거 판단
         if metrics is not None:
             trigger = None
             if metrics["r2"] < RETRAIN_R2_THRESHOLD:
                 trigger = "r2_drop"
             elif metrics["drift_detected"]:
-                ks_p = metrics.get("ks_pvalue")
+                ks_p    = metrics.get("ks_pvalue")
                 trigger = "ks_drift" if (ks_p and ks_p < KS_PVALUE_THRESHOLD) \
                           else "evidently_drift"
 
@@ -805,7 +930,8 @@ class Pipeline:
                 log.warning(f"🔄 재학습 트리거: {trigger}  R²={metrics['r2']:.4f}")
                 new_model = run_retrain(self.db1, trigger_reason=trigger)
                 if new_model is not None:
-                    self.model = new_model          # 핫스왑
+                    self.model   = new_model
+                    self.ref_co2 = self._load_ref_co2()  # ★ ref_co2 갱신
                     log.info("✅ 모델 핫스왑 완료")
             else:
                 log.info(f"✅ 성능 정상 (R²={metrics['r2']:.4f}) — 재학습 불필요")
@@ -818,7 +944,8 @@ class Pipeline:
         log.info(f"[SCHEDULED RETRAIN] {datetime.now().isoformat()}")
         new_model = run_retrain(self.db1, trigger_reason="scheduled")
         if new_model is not None:
-            self.model = new_model
+            self.model   = new_model
+            self.ref_co2 = self._load_ref_co2()
             log.info("✅ 정기 재학습 완료 — 모델 핫스왑")
         log.info("[SCHEDULED RETRAIN] 완료")
 

@@ -11,15 +11,13 @@
   09강  Discord Webhook 실시간 경고, Evidently AI 드리프트
   10강  KS Test 드리프트 탐지, 재학습 트리거 4종, Production 승격 비교
 
-[수정 이력 v2.1]
-  ✅ run_monitoring(): co2_predicted(t) → co2_in(t+3h) 시프트 매칭
-     (모델 타겟 shift(-3) = 3시간 후 예측이므로 +3h 매칭이 올바름)
-  ✅ DB3_TABLE_NAME = "sensor_data_3" (실제 Supabase 테이블명 반영)
-  ✅ RETRAIN_R2_THRESHOLD = 0.70 / DISCORD_R2_THRESHOLD = 0.60
-  ✅ run_retrain(): 전처리 CSV 우선 사용 → DB1 원본은 CSV 없을 때만
-     (DB1 원본 shift(-3) 시 datetime 비연속 구간에서 R2≈0 버그 수정)
-  ✅ build_train_features(): 선택적 컬럼 방어 처리
-  ✅ MODEL_PATH.parent.mkdir / 재학습 후 ref_co2 갱신
+[수정 이력 v2.2]
+  ✅ MODEL_PATH: lgbm_co2_1h.pkl → lgbm_co2.pkl
+  ✅ FEATURE_COLS: lag3 제거 → lag1, lag2만 (2시간 후 예측에 맞춤)
+  ✅ TARGET_COL: shift(-3) → shift(-2) (2시간 후 예측)
+  ✅ run_monitoring(): t → t+2h 시프트 매칭 (3h → 2h 수정)
+  ✅ build_train_features(): lag range(1,3), shift(-2) 수정
+  ✅ poll_and_predict(): lag .limit(2) 수정
 """
 
 # ─────────────────────────────────────────────────────────────────────
@@ -70,46 +68,45 @@ SUPABASE_KEY_DB2 = os.getenv("SUPABASE_KEY_DB2", "your-db2-key")
 SUPABASE_URL_DB3 = os.getenv("SUPABASE_URL_DB3", "https://your-db3.supabase.co")
 SUPABASE_KEY_DB3 = os.getenv("SUPABASE_KEY_DB3", "your-db3-key")
 
-# ── DB3 테이블명 (실제 Supabase DB3 테이블명: sensor_data_3)
+# ── DB3 테이블명
 DB3_TABLE_NAME = "sensor_data_3"
 
 # ── 09강: Discord Webhook URL ────────────────────────────────────────
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
 # ── 경로 ─────────────────────────────────────────────────────────────
-MODEL_PATH          = Path("./models/lgbm_co2_1h.pkl")
+MODEL_PATH          = Path("./models/lgbm_co2.pkl")          # ★ 수정
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
 EXPERIMENT_NAME     = "smartfarm_co2_monitoring"
 REGISTRY_MODEL_NAME = "smartfarm_co2_lgbm"
 
 # ── 재학습 트리거 임계값 (10강: 4종 트리거) ─────────────────────────
-# ※ 모델 실제 Test R²=0.73 기준으로 조정 (기존 0.85는 너무 높아 매번 재학습 발생)
 RETRAIN_R2_THRESHOLD    = 0.70
-KS_PVALUE_THRESHOLD     = 0.05   # ② KS Test p-value < 0.05 → 드리프트
-RETRAIN_WINDOW          = 48     # 최근 N개 예측으로 성능 평가
-RETRAIN_DATA_MIN_ROWS   = 500    # ③ 신규 데이터 최소 누적량
-RETRAIN_SCHEDULE_HOUR   = 2      # ④ 정기 배치: 매일 새벽 2시
+KS_PVALUE_THRESHOLD     = 0.05
+RETRAIN_WINDOW          = 48
+RETRAIN_DATA_MIN_ROWS   = 500
+RETRAIN_SCHEDULE_HOUR   = 2
 
-# ── 09강: Discord 경고 임계값 (현실적인 수준으로 조정) ───────────────
+# ── 09강: Discord 경고 임계값 ────────────────────────────────────────
 DISCORD_R2_THRESHOLD    = 0.60
 
 # ── 모델 예측 범위 ────────────────────────────────────────────────────
 CO2_CLIP_MIN = 300
 CO2_CLIP_MAX = 2000
 
-# ── 피처 / 타겟 (01_train_v2.ipynb 동일 순서) ───────────────────────
+# ── 피처 / 타겟 (lag3 제거 → lag1, lag2만 / 2시간 후 예측) ──────────
 FEATURE_COLS = [
     "temp_in", "hum_in", "co2_in", "soil_hum",
     "temp_out", "rain_out", "wind_out",
     "temp_diff",
     "hour", "month", "day_of_week", "is_daytime",
     "hour_sin", "hour_cos", "month_sin", "month_cos",
-    "temp_in_lag1",  "temp_in_lag2",  "temp_in_lag3",
-    "hum_in_lag1",   "hum_in_lag2",   "hum_in_lag3",
-    "co2_in_lag1",   "co2_in_lag2",   "co2_in_lag3",
-    "soil_hum_lag1", "soil_hum_lag2", "soil_hum_lag3",
+    "temp_in_lag1",  "temp_in_lag2",          # ★ lag3 제거
+    "hum_in_lag1",   "hum_in_lag2",           # ★ lag3 제거
+    "co2_in_lag1",   "co2_in_lag2",           # ★ lag3 제거
+    "soil_hum_lag1", "soil_hum_lag2",         # ★ lag3 제거
 ]
-TARGET_COL   = "next_co2_in"
+TARGET_COL   = "next_co2_in"                 # 2시간 후 CO2
 LAG_COLS_RAW = ["temp_in", "hum_in", "co2_in", "soil_hum"]
 
 # ── LightGBM 재학습 하이퍼파라미터 ──────────────────────────────────
@@ -161,8 +158,8 @@ def init_mlflow():
 # ─────────────────────────────────────────────────────────────────────
 def build_features(target_row: dict, lag_rows: list[dict]) -> pd.DataFrame:
     """
-    DB2 신규 1행 + 직전 3행 → 28개 피처 DataFrame(1행)
-    co2_in = Null 일 때 co2_predicted로 lag 피처 재활용 (오차 누적 최소화)
+    DB2 신규 1행 + 직전 2행 → 24개 피처 DataFrame(1행)   ★ lag3 제거
+    co2_in = Null 일 때 co2_predicted로 lag 피처 재활용
     """
     row = dict(target_row)
 
@@ -176,14 +173,12 @@ def build_features(target_row: dict, lag_rows: list[dict]) -> pd.DataFrame:
 
     dt = pd.to_datetime(row["datetime"])
 
-    # 파생 피처 — None 방어 처리
     temp_in  = float(row.get("temp_in")  or 20.0)
     temp_out = float(row.get("temp_out") or 15.0)
     row["temp_in"]   = temp_in
     row["temp_out"]  = temp_out
     row["temp_diff"] = temp_in - temp_out
 
-    # 시간 피처
     row["hour"]        = dt.hour
     row["month"]       = dt.month
     row["day_of_week"] = dt.dayofweek
@@ -193,8 +188,8 @@ def build_features(target_row: dict, lag_rows: list[dict]) -> pd.DataFrame:
     row["month_sin"]   = np.sin(2 * np.pi * dt.month / 12)
     row["month_cos"]   = np.cos(2 * np.pi * dt.month / 12)
 
-    # lag 피처 (co2 → co2_predicted 재활용)
-    for lag_idx, lag_row in enumerate(lag_rows, start=1):
+    # lag 피처 — lag1, lag2만 사용  ★ lag3 제거
+    for lag_idx, lag_row in enumerate(lag_rows[:2], start=1):
         for col in LAG_COLS_RAW:
             val = (lag_row.get("co2_predicted") or lag_row.get(col)) if col == "co2_in" \
                   else lag_row.get(col)
@@ -202,7 +197,6 @@ def build_features(target_row: dict, lag_rows: list[dict]) -> pd.DataFrame:
 
     feat_df = pd.DataFrame([{k: row.get(k, np.nan) for k in FEATURE_COLS}])
 
-    # 모든 피처 float 변환 (object 타입 방지)
     for col in feat_df.columns:
         feat_df[col] = pd.to_numeric(feat_df[col], errors="coerce")
 
@@ -219,7 +213,6 @@ def build_features(target_row: dict, lag_rows: list[dict]) -> pd.DataFrame:
 def poll_and_predict(db2: Client, model: lgb.LGBMRegressor) -> list[dict]:
     """
     co2_in = Null + co2_predicted = Null 행 감지 → 예측 → DB2 업데이트
-    Returns: 예측 완료된 행 목록 (제어 판단용)
     """
     res = (
         db2.table("sensor_data_2")
@@ -248,11 +241,11 @@ def poll_and_predict(db2: Client, model: lgb.LGBMRegressor) -> list[dict]:
                 .select("*")
                 .lt("datetime", dt_str)
                 .order("datetime", desc=True)
-                .limit(3)
+                .limit(2)                    # ★ 3 → 2 (lag2까지만 필요)
                 .execute()
             )
             lag_rows = lag_res.data
-            if len(lag_rows) < 3:
+            if len(lag_rows) < 2:            # ★ 3 → 2
                 log.warning(f"lag 행 부족 ({len(lag_rows)}개) — 스킵: {dt_str}")
                 continue
 
@@ -282,7 +275,6 @@ def compute_control(co2_pred: float, temp_in: float, hum_in: float,
     """
     논문 근거 우선순위 계층 (Safety → Base → Adjust → Clip)
     CH1=환기팬, CH2=창문, CH3=히터, CH4=워터펌프
-    반환값: 초/주기 (환기팬·창문·히터: 600초 주기 / 워터펌프: 180초 주기)
     """
     CYCLE   = 600
     CYCLE_P = 180
@@ -431,12 +423,10 @@ def run_ks_test(ref_values: np.ndarray, curr_values: np.ndarray,
 def run_monitoring(db2: Client, db3: Client,
                    ref_co2_values: np.ndarray | None = None) -> dict | None:
     """
-    ★ 핵심 수정: co2_predicted(t) ↔ co2_in(t+1h) 시프트 매칭
-    모델이 "1시간 후 CO2"를 예측하므로
-    t 시점 예측값은 반드시 t+1h 시점의 실제값과 비교해야 함
-    기존 코드(같은 시간 매칭)는 완전히 다른 값끼리 비교 → R²=-0.48 발생
+    ★ 수정: co2_predicted(t) ↔ co2_in(t+2h) 시프트 매칭
+    모델 타겟 shift(-2) = 2시간 후 CO2 예측이므로
+    t 시점 예측값은 t+2h 시점의 실제값과 비교
     """
-    # ── DB2: 최근 예측값 로드 ──────────────────────────────────────
     res2 = (
         db2.table("sensor_data_2")
         .select("datetime, co2_predicted")
@@ -450,7 +440,6 @@ def run_monitoring(db2: Client, db3: Client,
         log.warning("모니터링: DB2 예측값 없음")
         return None
 
-    # ── DB3: 실제값 로드 (CO2_in 테이블) ────────────────────────
     res3 = (
         db3.table(DB3_TABLE_NAME)
         .select("datetime, co2_in")
@@ -464,7 +453,6 @@ def run_monitoring(db2: Client, db3: Client,
         log.warning("모니터링: DB3 실제값 없음 (아직 누적 중)")
         return None
 
-    # ── datetime 파싱 및 시간 단위 truncate ───────────────────────
     pred_df["dt_hour"] = (
         pd.to_datetime(pred_df["datetime"], format="mixed", utc=True)
         .dt.floor("h")
@@ -474,10 +462,8 @@ def run_monitoring(db2: Client, db3: Client,
         .dt.floor("h")
     )
 
-    # ── [핵심] t 시점 예측 → t+3h 시점 실제값 매칭 ──────────────
-    # 모델 타겟: next_co2_in = shift(-3) → 3시간 후 CO2 예측
-    # co2_predicted(t) 는 (t+3h) 시점의 co2_in 과 비교해야 정확함
-    pred_df["dt_match"] = pred_df["dt_hour"] + pd.Timedelta(hours=3)
+    # ★ 핵심 수정: t → t+2h 매칭 (기존 t+3h → t+2h)
+    pred_df["dt_match"] = pred_df["dt_hour"] + pd.Timedelta(hours=2)
 
     merged = pd.merge(
         pred_df[["dt_match", "co2_predicted"]],
@@ -486,12 +472,12 @@ def run_monitoring(db2: Client, db3: Client,
         right_on="dt_hour",
         how="inner",
     )
-    log.info(f"datetime 시프트 매칭 (t → t+3h): {len(merged)}개 매칭")
+    log.info(f"datetime 시프트 매칭 (t → t+2h): {len(merged)}개 매칭")
 
     if len(merged) < 5:
         log.warning(
             f"모니터링: 매칭 행 부족 ({len(merged)}개) "
-            f"— DB3 실시간 데이터가 3시간 이상 쌓일 때까지 대기"
+            f"— DB3 실시간 데이터가 2시간 이상 쌓일 때까지 대기"
         )
         return None
 
@@ -509,12 +495,10 @@ def run_monitoring(db2: Client, db3: Client,
         f"RMSE={rmse:.2f}  MAE={mae:.2f}  R²={r2:.4f}  MAPE={mape:.2f}%"
     )
 
-    # ── 10강: KS Test 드리프트 탐지 ─────────────────────────────
     ks_result = {"ks_stat": None, "ks_pvalue": None, "drift": False}
     if ref_co2_values is not None and len(ref_co2_values) > 0:
         ks_result = run_ks_test(ref_co2_values, y_pred, feature_name="co2_predicted")
 
-    # ── 09강: Evidently AI 드리프트 리포트 ──────────────────────
     evidently_drift = False
     try:
         from evidently.report import Report
@@ -535,13 +519,12 @@ def run_monitoring(db2: Client, db3: Client,
         log.info(f"Evidently 리포트 저장: {report_path}  drift={evidently_drift}")
 
     except ImportError:
-        log.info("Evidently 미설치 — 드리프트 감지 스킵 (pip install evidently)")
+        log.info("Evidently 미설치 — 드리프트 감지 스킵")
     except Exception as e:
         log.warning(f"Evidently 오류: {e}")
 
     drift_detected = evidently_drift or ks_result["drift"]
 
-    # ── 05강/09강: MLflow Tracking — params / metrics 완전 분리 ─
     try:
         with mlflow.start_run(
             run_name=f"monitor_{datetime.now().strftime('%Y%m%d_%H%M')}"
@@ -552,7 +535,7 @@ def run_monitoring(db2: Client, db3: Client,
                 "monitoring_window":    RETRAIN_WINDOW,
                 "model_path":           str(MODEL_PATH),
                 "n_samples":            len(merged),
-                "match_mode":           "t_to_t+1h_shift",
+                "match_mode":           "t_to_t+2h_shift",  # ★ 수정
             })
             mlflow.log_metrics({
                 "rmse":       rmse,
@@ -567,7 +550,6 @@ def run_monitoring(db2: Client, db3: Client,
     except Exception as e:
         log.warning(f"MLflow 기록 실패: {e}")
 
-    # ── 09강: Discord 경고 ───────────────────────────────────────
     if r2 < DISCORD_R2_THRESHOLD:
         send_discord_alert(
             f"🚨 [스마트팜 CO2 모델 경고]\n"
@@ -604,26 +586,23 @@ def run_monitoring(db2: Client, db3: Client,
 def build_train_features(raw_df: pd.DataFrame) -> pd.DataFrame:
     """
     DB1 원본 데이터 → 학습용 피처 엔지니어링
-    ※ solar_out / rain_out / wind_out 컬럼 없어도 동작
-    ※ datetime 비연속 구간 전후 행의 타겟/lag를 NaN으로 명시 처리
-       → shift(-3)이 다른 날짜 CO2와 엮이는 타겟 오염 완전 차단
+    ★ lag range(1,3) → range(1,3) 유지하되 lag3 컬럼은 FEATURE_COLS에 없으므로 무해
+    ★ shift(-3) → shift(-2) (2시간 후 예측)
     """
     df = raw_df.copy().sort_values("datetime").reset_index(drop=True)
     df["datetime"] = pd.to_datetime(df["datetime"], format="mixed", utc=True)
 
-    # ── datetime 비연속 구간 감지 (2시간 초과 간격 = 비연속) ─────────
+    # datetime 비연속 구간 감지 (2시간 초과 간격)
     time_diff_h = df["datetime"].diff().dt.total_seconds() / 3600
-    gap_after  = set(df.index[time_diff_h > 2].tolist())   # gap 직후 인덱스
-    # gap 직전 3행: shift(-3) 타겟이 gap 너머 값을 보는 행
+    gap_after  = set(df.index[time_diff_h > 2].tolist())
     gap_before = set()
     for idx in gap_after:
-        for k in range(1, 4):
+        for k in range(1, 3):           # ★ 3 → 2 (shift(-2) 기준)
             if idx - k >= 0:
                 gap_before.add(idx - k)
-    # gap 직후 3행: lag 피처가 오염되는 행
     gap_lag = set()
     for idx in gap_after:
-        for k in range(0, 3):
+        for k in range(0, 2):           # ★ 3 → 2
             if idx + k < len(df):
                 gap_lag.add(idx + k)
 
@@ -652,18 +631,16 @@ def build_train_features(raw_df: pd.DataFrame) -> pd.DataFrame:
 
     for col in LAG_COLS_RAW:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-        for lag in range(1, 4):
+        for lag in range(1, 3):         # ★ range(1,4) → range(1,3) (lag1, lag2만)
             df[f"{col}_lag{lag}"] = df[col].shift(lag)
 
-    # lag 오염 행 NaN 처리
-    lag_cols = [f"{col}_lag{lag}" for col in LAG_COLS_RAW for lag in range(1, 4)]
+    lag_cols = [f"{col}_lag{lag}" for col in LAG_COLS_RAW for lag in range(1, 3)]
     if gap_lag:
         df.loc[list(gap_lag), lag_cols] = np.nan
 
-    # 타겟: 3시간 후 CO2
-    df["next_co2_in"] = df["co2_in"].shift(-3)
+    # ★ 타겟: 2시간 후 CO2 (shift(-3) → shift(-2))
+    df["next_co2_in"] = df["co2_in"].shift(-2)
 
-    # 타겟 오염 행 NaN 처리 → dropna로 자동 제거
     if gap_before:
         df.loc[list(gap_before), "next_co2_in"] = np.nan
 
@@ -673,20 +650,10 @@ def build_train_features(raw_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def run_retrain(db1: Client, trigger_reason: str = "manual") -> lgb.LGBMRegressor | None:
-    """
-    10강: 재학습 → 기존 Production 모델과 성능 비교 → 성능 향상 시 Production 승격
-
-    데이터 소스 우선순위:
-      1순위: 전처리 완료 CSV (train.csv / val.csv / test.csv) — 정확한 피처/타겟 보장
-      2순위: DB1 원본 데이터 — CSV 없을 때만 사용 (datetime 연속성 검증 포함)
-
-    ※ DB1 원본에서 shift(-3)으로 타겟 생성 시 datetime 비연속 구간이 있으면
-       전혀 다른 날짜의 CO2와 엮여 R²≈0 이 되는 문제 → CSV 우선 사용
-    """
+    """10강: 재학습 → 기존 모델과 성능 비교 → 성능 향상 시 Production 승격"""
     log.info(f"=== [재학습 시작] 트리거: {trigger_reason} ===")
 
     try:
-        # ── 1순위: 전처리 완료 CSV 로드 ──────────────────────────
         csv_candidates = [
             (Path("./data/train.csv"), Path("./data/val.csv"), Path("./data/test.csv")),
             (Path("/app/data/train.csv"), Path("/app/data/val.csv"), Path("/app/data/test.csv")),
@@ -706,7 +673,6 @@ def run_retrain(db1: Client, trigger_reason: str = "manual") -> lgb.LGBMRegresso
                 break
 
         if train_df is None:
-            # ── 2순위: DB1 원본 데이터 (CSV 없을 때만) ───────────
             log.info("전처리 CSV 없음 — DB1 원본 데이터 사용")
             all_data = []
             offset   = 0
@@ -748,7 +714,6 @@ def run_retrain(db1: Client, trigger_reason: str = "manual") -> lgb.LGBMRegresso
         X_va, y_va = val_df[FEATURE_COLS],   val_df[TARGET_COL]
         X_te, y_te = test_df[FEATURE_COLS],  test_df[TARGET_COL]
 
-        # ── 재학습 ───────────────────────────────────────────────
         params = copy.deepcopy(LGB_PARAMS)
         n_est  = params.pop("n_estimators")
         new_model = lgb.LGBMRegressor(**params, n_estimators=n_est)
@@ -767,7 +732,6 @@ def run_retrain(db1: Client, trigger_reason: str = "manual") -> lgb.LGBMRegresso
         mae_new  = float(mean_absolute_error(y_te, pred_new))
         log.info(f"[재학습] 신규 모델 — RMSE={rmse_new:.4f}  R²={r2_new:.4f}")
 
-        # ── 10강: 기존 모델과 성능 비교 ─────────────────────────
         current_model = load_model()
         pred_curr     = current_model.predict(X_te)
         r2_curr       = float(r2_score(y_te, pred_curr))
@@ -785,12 +749,10 @@ def run_retrain(db1: Client, trigger_reason: str = "manual") -> lgb.LGBMRegresso
             )
             return None
 
-        # ── pkl 갱신 ─────────────────────────────────────────────
         MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump(new_model, MODEL_PATH)
         log.info(f"[재학습] pkl 갱신 완료: {MODEL_PATH}")
 
-        # ── 10강: MLflow Model Registry 등록 + Production 승격 ──
         try:
             with mlflow.start_run(
                 run_name=f"retrain_{datetime.now().strftime('%Y%m%d_%H%M')}"
@@ -826,7 +788,7 @@ def run_retrain(db1: Client, trigger_reason: str = "manual") -> lgb.LGBMRegresso
                     stage="Production",
                     archive_existing_versions=True,
                 )
-                log.info(f"Model Registry: v{new_ver} → Production 승격 (기존 → Archive)")
+                log.info(f"Model Registry: v{new_ver} → Production 승격")
 
             send_discord_alert(
                 f"✅ [재학습 + Production 승격]\n"
@@ -858,7 +820,6 @@ class Pipeline:
         log.info("Pipeline 초기화 완료")
 
     def _load_ref_co2(self) -> np.ndarray | None:
-        """KS Test 기준값 로드 (train.csv co2_in 분포)"""
         ref_paths = [
             Path("./models/train_co2_ref.npy"),
             Path("/content/drive/MyDrive/스마트팜 프로젝트"
@@ -884,14 +845,11 @@ class Pipeline:
         self.model = load_model()
 
     def hourly_step(self):
-        """매 1시간마다 실행 — 예측 → 제어 → 모니터링 → 재학습 판단"""
         log.info("=" * 65)
         log.info(f"[HOURLY STEP] {datetime.now(timezone.utc).isoformat()}")
 
-        # Step 1~4: DB2 폴링 & 예측
         predicted_rows = poll_and_predict(self.db2, self.model)
 
-        # Step 5: 제어 계산
         for row in predicted_rows:
             try:
                 ctrl = compute_control(
@@ -913,10 +871,8 @@ class Pipeline:
             except Exception as e:
                 log.error(f"제어 계산 오류: {e}")
 
-        # Step 6~7: 모니터링 + 드리프트 감지
         metrics = run_monitoring(self.db2, self.db3, ref_co2_values=self.ref_co2)
 
-        # Step 8: 재학습 트리거 판단
         if metrics is not None:
             trigger = None
             if metrics["r2"] < RETRAIN_R2_THRESHOLD:
@@ -931,7 +887,7 @@ class Pipeline:
                 new_model = run_retrain(self.db1, trigger_reason=trigger)
                 if new_model is not None:
                     self.model   = new_model
-                    self.ref_co2 = self._load_ref_co2()  # ★ ref_co2 갱신
+                    self.ref_co2 = self._load_ref_co2()
                     log.info("✅ 모델 핫스왑 완료")
             else:
                 log.info(f"✅ 성능 정상 (R²={metrics['r2']:.4f}) — 재학습 불필요")
@@ -939,7 +895,6 @@ class Pipeline:
         log.info("[HOURLY STEP] 완료")
 
     def scheduled_step(self):
-        """10강 ④ 정기 배치 재학습 — 매일 새벽 2시"""
         log.info("=" * 65)
         log.info(f"[SCHEDULED RETRAIN] {datetime.now().isoformat()}")
         new_model = run_retrain(self.db1, trigger_reason="scheduled")
@@ -960,14 +915,9 @@ def main():
     log.info("=" * 65)
 
     pipeline = Pipeline()
-
-    # 즉시 1회 실행
     pipeline.hourly_step()
 
-    # 01강 CT: 1시간 주기 이벤트 기반 재학습
     schedule.every(1).hours.do(pipeline.hourly_step)
-
-    # 10강 ④: 매일 새벽 2시 정기 배치 재학습
     schedule.every().day.at(f"{RETRAIN_SCHEDULE_HOUR:02d}:00").do(pipeline.scheduled_step)
 
     log.info("스케줄 등록 완료:")

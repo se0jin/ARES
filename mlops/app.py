@@ -1,16 +1,28 @@
 """
-app.py — 스마트팜 CO2 예측 FastAPI 서버 (06강)
+app.py — 스마트팜 환경값 예측 FastAPI 서버 (06강) · nowcast(설계 A) / co2+temp 듀얼 모델
 =====================================================================
+설계:
+  - DB2 교차 결측 시뮬레이션:
+      홀수 시간 → co2_in = Null  (co2 센서 고장)  → co2 모델로 현재 co2 예측
+      짝수 시간 → temp_in = Null (temp 센서 고장) → temp 모델로 현재 temp 예측
+  - 두 모델 모두 'nowcast'(현재 시점 값 예측). 고장난 센서의 그 시각 값을 즉시 추정.
+  - 단일 고장 가정: co2 예측 시 temp는 살아있고, temp 예측 시 co2는 살아있음(교차라 항상 성립).
+
+핵심 동작:
+  1) lgbm_co2_aug.pkl, lgbm_temp_aug.pkl 두 '번들'(dict) 로드
+  2) 피처 목록은 각 번들의 features를 그대로 사용(하드코딩 X)
+     - co2 모델 피처엔 co2_in 없음 / temp 모델 피처엔 temp_in·temp_diff 없음
+  3) /predict/simple : 센서 입력 → Null인 센서를 자동 감지해 해당 모델로 예측
+     (target을 명시하면 그걸 우선)
+  4) 고장 센서의 lag는 미제공 시 NaN(장기 고장), 살아있는 센서 lag는 현재값으로 대체
+
 엔드포인트:
-  GET  /          헬스 체크
-  GET  /model     현재 모델 정보 (버전, 피처 수)
-  POST /predict   24개 피처 입력 → CO2 예측값 + 제어 명령 반환
-  POST /predict/simple  원본 센서 7개만 입력 → 피처 자동 생성 후 예측
+  GET  /                헬스 체크 (로드된 모델 목록)
+  GET  /model           두 모델 정보(번들 메타 + 피처)
+  POST /predict         target + 전처리 완료 피처(dict) → 현재값 예측
+  POST /predict/simple  원본 센서 입력 → 타겟 자동 감지 → 현재값 예측 + 제어
 
-실행:
-  uvicorn app:app --host 0.0.0.0 --port 8000 --reload
-
-Swagger UI: http://localhost:8000/docs
+실행:  uvicorn app:app --host 0.0.0.0 --port 8000 --reload
 """
 
 import joblib
@@ -18,118 +30,115 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 # ─────────────────────────────────────────────────────────────────────
-# 상수 & 모델 로드
+# 모델(번들) 로드 — target 이름(co2_in / temp_in) 기준으로 관리
+#   ★ 파일명은 레포 mlops/models/ 실제 파일과 반드시 일치시킬 것
 # ─────────────────────────────────────────────────────────────────────
-MODEL_PATH   = Path("./models/lgbm_co2.pkl")   # ★ 수정
-CO2_CLIP_MIN = 300
-CO2_CLIP_MAX = 2000
+MODEL_FILES = {
+    "co2_in":  Path("./models/lgbm_co2_aug.pkl"),
+    "temp_in": Path("./models/lgbm_temp_aug.pkl"),
+}
 
-FEATURE_COLS = [
-    "temp_in", "hum_in", "co2_in", "soil_hum",
-    "temp_out", "rain_out", "wind_out",
-    "temp_diff",
-    "hour", "month", "day_of_week", "is_daytime",
-    "hour_sin", "hour_cos", "month_sin", "month_cos",
-    "temp_in_lag1",  "temp_in_lag2",          # ★ lag3 제거
-    "hum_in_lag1",   "hum_in_lag2",           # ★ lag3 제거
-    "co2_in_lag1",   "co2_in_lag2",           # ★ lag3 제거
-    "soil_hum_lag1", "soil_hum_lag2",         # ★ lag3 제거
-]
+BUNDLES: Dict[str, dict] = {}   # target -> {model, features, clip, ...}
 
-try:
-    model = joblib.load(MODEL_PATH)
-    print(f"✅ 모델 로드 완료: {MODEL_PATH}")
-except FileNotFoundError:
-    model = None
-    print(f"⚠️  모델 파일 없음: {MODEL_PATH}  — /predict 호출 시 503 반환")
+for tgt, path in MODEL_FILES.items():
+    try:
+        b = joblib.load(path)
+        if isinstance(b, dict) and "model" in b:
+            b["clip"] = tuple(b.get("clip", (None, None)))
+            b["features"] = list(b["features"])
+            BUNDLES[tgt] = b
+            print(f"✅ {tgt:8s} 로드: {path} | 피처 {len(b['features'])}개 | mode={b.get('mode','nowcast')}")
+        else:
+            print(f"⚠️  {tgt}: 번들 형식 아님({path}) — features 포함 번들로 재학습 권장")
+    except FileNotFoundError:
+        print(f"⚠️  {tgt}: 파일 없음 {path}")
 
 app = FastAPI(
-    title="스마트팜 CO2 예측 API",
-    description="LightGBM 기반 온실 CO2 2시간 후 예측 + 규칙 기반 제어 명령 API",
-    version="1.1.0",
+    title="스마트팜 환경 예측 API (nowcast · co2+temp)",
+    description="LightGBM 기반 — 센서 고장 시 그 시각 값을 즉시 추정. 홀수시 co2 / 짝수시 temp 교차 예측.",
+    version="3.0.0",
 )
 
+# 센서별 lag 컬럼 베이스
+LAG_BASES = ["temp_in", "hum_in", "co2_in", "soil_hum"]
+
 
 # ─────────────────────────────────────────────────────────────────────
-# Pydantic 입력 모델 (06강)
+# Pydantic 입력 모델
 # ─────────────────────────────────────────────────────────────────────
-class CO2Input(BaseModel):
-    """24개 피처 전체 직접 입력 (전처리 완료 상태)"""
-    temp_in:       float = Field(..., example=25.3,  description="내부 온도 (°C)")
-    hum_in:        float = Field(..., example=65.0,  description="내부 습도 (%)")
-    co2_in:        float = Field(..., example=750.0, description="현재 CO2 (ppm) — 고장 시 이전 예측값 사용")
-    soil_hum:      float = Field(..., example=35.0,  description="토양 수분 (%)")
-    temp_out:      float = Field(..., example=18.0,  description="외부 온도 (°C)")
-    rain_out:      float = Field(..., example=0.0,   description="강우 여부 (0=없음, 1=있음)")
-    wind_out:      float = Field(..., example=2.5,   description="외부 풍속 (m/s)")
-    temp_diff:     float = Field(..., example=7.3,   description="내외부 온도 차 (temp_in - temp_out)")
-    hour:          float = Field(..., example=14.0,  description="시 (0~23)")
-    month:         float = Field(..., example=5.0,   description="월 (1~12)")
-    day_of_week:   float = Field(..., example=2.0,   description="요일 (0=월 ~ 6=일)")
-    is_daytime:    float = Field(..., example=1.0,   description="주간 여부 (6~19시=1)")
-    hour_sin:      float = Field(..., example=0.0,   description="시간 sin 인코딩")
-    hour_cos:      float = Field(..., example=-1.0,  description="시간 cos 인코딩")
-    month_sin:     float = Field(..., example=1.0,   description="월 sin 인코딩")
-    month_cos:     float = Field(..., example=0.0,   description="월 cos 인코딩")
-    temp_in_lag1:  float = Field(..., example=25.0)
-    temp_in_lag2:  float = Field(..., example=24.8)
-    hum_in_lag1:   float = Field(..., example=64.0)
-    hum_in_lag2:   float = Field(..., example=63.5)
-    co2_in_lag1:   float = Field(..., example=740.0)
-    co2_in_lag2:   float = Field(..., example=730.0)
-    soil_hum_lag1: float = Field(..., example=35.5)
-    soil_hum_lag2: float = Field(..., example=36.0)
+class PredictInput(BaseModel):
+    """전처리 완료 피처 직접 입력. target은 'co2_in' 또는 'temp_in'."""
+    target:   str = Field(..., example="co2_in", description="예측 대상: co2_in 또는 temp_in")
+    features: Dict[str, float] = Field(..., description="피처명:값 딕셔너리 (해당 모델 피처 일부/전부)")
 
 
 class SimpleSensorInput(BaseModel):
-    """원본 센서 7개 입력 → 피처 자동 생성 (간편 엔드포인트)"""
-    datetime_str:  Optional[str]   = Field(None, example="2025-05-23 14:00:00", description="측정 시각 (없으면 현재 시각 사용)")
-    temp_in:       float = Field(..., example=25.3)
-    hum_in:        float = Field(..., example=65.0)
-    co2_in:        float = Field(..., example=750.0)
-    soil_hum:      float = Field(..., example=35.0)
-    temp_out:      float = Field(..., example=18.0)
-    rain_out:      float = Field(0.0, example=0.0)
-    wind_out:      float = Field(2.5, example=2.5)
-    # lag 1~2만 사용 (★ lag3 제거)
-    co2_in_lag1:   Optional[float] = Field(None, example=740.0)
-    co2_in_lag2:   Optional[float] = Field(None, example=730.0)
-    temp_in_lag1:  Optional[float] = Field(None, example=25.0)
-    temp_in_lag2:  Optional[float] = Field(None, example=24.8)
-    hum_in_lag1:   Optional[float] = Field(None, example=64.0)
-    hum_in_lag2:   Optional[float] = Field(None, example=63.5)
-    soil_hum_lag1: Optional[float] = Field(None, example=35.5)
-    soil_hum_lag2: Optional[float] = Field(None, example=36.0)
+    """
+    원본 센서 입력 → 시간/lag 피처 자동 생성.
+    고장난 센서값(co2_in 또는 temp_in)은 None으로 두면 그 센서를 예측 대상으로 자동 인식.
+    """
+    datetime_str: Optional[str] = Field(None, example="2025-05-23 13:00:00",
+                                        description="측정 시각(없으면 현재 시각)")
+    target:       Optional[str] = Field(None, example="co2_in",
+                                        description="예측 대상 직접 지정(미지정 시 Null 센서 자동 감지)")
+    # 센서 현재값 — 고장난 것은 None
+    co2_in:   Optional[float] = Field(None, example=None,  description="현재 CO2(고장이면 None)")
+    temp_in:  Optional[float] = Field(None, example=25.3,  description="현재 내부온도(고장이면 None)")
+    hum_in:   float = Field(..., example=65.0)
+    soil_hum: float = Field(..., example=35.0)
+    temp_out: float = Field(..., example=18.0)
+    rain_out: float = Field(0.0, example=0.0)
+    wind_out: float = Field(2.5, example=2.5)
+    # lag (있으면 정확도↑). 고장 센서 lag는 모르면 생략 → NaN
+    co2_in_lag1:   Optional[float] = Field(None)
+    co2_in_lag2:   Optional[float] = Field(None)
+    co2_in_lag3:   Optional[float] = Field(None)
+    temp_in_lag1:  Optional[float] = Field(None)
+    temp_in_lag2:  Optional[float] = Field(None)
+    temp_in_lag3:  Optional[float] = Field(None)
+    hum_in_lag1:   Optional[float] = Field(None)
+    hum_in_lag2:   Optional[float] = Field(None)
+    hum_in_lag3:   Optional[float] = Field(None)
+    soil_hum_lag1: Optional[float] = Field(None)
+    soil_hum_lag2: Optional[float] = Field(None)
+    soil_hum_lag3: Optional[float] = Field(None)
 
 
 # ─────────────────────────────────────────────────────────────────────
 # 유틸리티
 # ─────────────────────────────────────────────────────────────────────
-def _check_model():
-    if model is None:
-        raise HTTPException(status_code=503, detail=f"모델 파일 없음: {MODEL_PATH}")
+def _get_bundle(target: str) -> dict:
+    if target not in BUNDLES:
+        raise HTTPException(status_code=503,
+                            detail=f"'{target}' 모델 미로드. 로드됨: {list(BUNDLES.keys())}")
+    return BUNDLES[target]
 
 
-def _predict_raw(feat_df: pd.DataFrame) -> float:
-    pred = float(model.predict(feat_df)[0])
-    return float(np.clip(pred, CO2_CLIP_MIN, CO2_CLIP_MAX))
+def _predict(target: str, row: dict) -> float:
+    b = _get_bundle(target)
+    feats, (lo, hi) = b["features"], b["clip"]
+    X = pd.DataFrame([[row.get(c, np.nan) for c in feats]], columns=feats)
+    pred = float(b["model"].predict(X)[0])
+    return float(np.clip(pred, lo, hi)) if lo is not None else pred
 
 
-def _build_control_summary(co2_pred: float, temp_in: float, hum_in: float,
-                            rain_out: float, wind_out: float) -> dict:
-    """간단 제어 상태 요약 반환 (상세 계산은 02_pipeline.py 참조)"""
+def _build_control(co2: Optional[float], temp_in: Optional[float],
+                   hum_in: float, rain_out: float, wind_out: float) -> dict:
+    """현재 co2·temp 기반 간단 제어 요약(상세 계산은 02_pipeline.py)."""
+    c = co2 if co2 is not None else 0.0
+    t = temp_in if temp_in is not None else 20.0
     return {
-        "ventilation_fan": "ON"  if (temp_in > 28 or co2_pred > 1000) and rain_out == 0 else "OFF",
-        "window":          "ON"  if (temp_in > 28 or co2_pred > 1500) and rain_out == 0 and wind_out < 8 else "OFF",
-        "heater":          "ON"  if temp_in < 12 else "OFF",
-        "water_pump":      "ON"  if hum_in < 10 else "OFF",
-        "co2_level":       "위험" if co2_pred > 1500 else ("주의" if co2_pred > 1000 else "정상"),
+        "ventilation_fan": "ON" if (t > 28 or c > 1000) and rain_out == 0 else "OFF",
+        "window":          "ON" if (t > 28 or c > 1500) and rain_out == 0 and wind_out < 8 else "OFF",
+        "heater":          "ON" if t < 12 else "OFF",
+        "water_pump":      "ON" if hum_in < 10 else "OFF",
+        "co2_level":       "위험" if c > 1500 else ("주의" if c > 1000 else "정상"),
     }
 
 
@@ -139,100 +148,110 @@ def _build_control_summary(co2_pred: float, temp_in: float, hum_in: float,
 @app.get("/", summary="헬스 체크")
 def read_root():
     return {
-        "status":       "ok",
-        "service":      "스마트팜 CO2 예측 API",
-        "model_loaded": model is not None,
-        "timestamp":    datetime.now().isoformat(),
+        "status":        "ok",
+        "service":       "스마트팜 환경 예측 API (nowcast · co2+temp)",
+        "models_loaded": list(BUNDLES.keys()),
+        "timestamp":     datetime.now().isoformat(),
     }
 
 
-@app.get("/model", summary="현재 모델 정보")
+@app.get("/model", summary="모델 정보(두 모델)")
 def model_info():
-    _check_model()
+    if not BUNDLES:
+        raise HTTPException(status_code=503, detail="로드된 모델 없음")
+    out = {}
+    for tgt, b in BUNDLES.items():
+        out[tgt] = {
+            "model_type":    type(b["model"]).__name__,
+            "mode":          b.get("mode", "nowcast"),
+            "target":        f"{tgt} (현재 시점 값)",
+            "clip":          list(b["clip"]),
+            "n_features":    len(b["features"]),
+            "self_excluded": tgt not in b["features"],   # nowcast면 True여야 정상
+            "feature_cols":  b["features"],
+        }
+    return out
+
+
+@app.post("/predict", summary="현재값 예측 (target + 피처 dict)")
+def predict(inp: PredictInput):
+    _get_bundle(inp.target)
+    row = dict(inp.features)
+    base = inp.target
+    for L in (1, 2, 3):                       # 고장 센서 lag 누락 시 NaN
+        row.setdefault(f"{base}_lag{L}", np.nan)
+    val = _predict(inp.target, row)
     return {
-        "model_path":   str(MODEL_PATH),
-        "model_type":   type(model).__name__,
-        "best_iter":    getattr(model, "best_iteration_", "N/A"),
-        "n_features":   len(FEATURE_COLS),
-        "feature_cols": FEATURE_COLS,
-        "target":       "next_co2_in (2시간 후 CO2 ppm)",   # ★ 수정
-    }
-
-
-@app.post("/predict", summary="CO2 예측 (24개 피처 전체 입력)")
-def predict(input_data: CO2Input):
-    """
-    06강 FastAPI 예측 엔드포인트
-
-    - 입력: 24개 피처 (전처리 완료 상태)
-    - 출력: co2_predicted (2시간 후 CO2 ppm) + 제어 명령 요약
-    """
-    _check_model()
-
-    row     = input_data.model_dump()
-    feat_df = pd.DataFrame([[row[c] for c in FEATURE_COLS]], columns=FEATURE_COLS)
-
-    co2_pred = _predict_raw(feat_df)
-    control  = _build_control_summary(
-        co2_pred, row["temp_in"], row["hum_in"], row["rain_out"], row["wind_out"]
-    )
-
-    return {
-        "co2_predicted_ppm": round(co2_pred, 1),
-        "prediction_target": "2시간 후 CO2 농도",           # ★ 수정
-        "control_commands":  control,
+        "target":            inp.target,
+        "predicted_value":   round(val, 1),
+        "prediction_target": f"{inp.target} 현재 시점 값",
         "timestamp":         datetime.now().isoformat(),
     }
 
 
-@app.post("/predict/simple", summary="CO2 예측 (센서 7개 간편 입력)")
-def predict_simple(input_data: SimpleSensorInput):
+@app.post("/predict/simple", summary="현재값 예측 (센서 입력 → 타겟 자동 감지)")
+def predict_simple(inp: SimpleSensorInput):
     """
-    원본 센서값 7개만 입력하면 피처를 자동 생성하여 예측합니다.
-    lag 값이 없으면 현재 센서값으로 대체합니다.
+    라즈베리파이/파이프라인이 호출. co2_in 또는 temp_in 중 None인 센서를 자동으로 예측 대상으로 인식.
+    (홀수시 co2_in=None / 짝수시 temp_in=None)
     """
-    _check_model()
+    # 1) 예측 대상 결정
+    target = inp.target
+    if target is None:
+        if inp.co2_in is None and inp.temp_in is not None:
+            target = "co2_in"
+        elif inp.temp_in is None and inp.co2_in is not None:
+            target = "temp_in"
+        else:
+            raise HTTPException(status_code=400,
+                detail="예측 대상을 정할 수 없음 — co2_in/temp_in 중 정확히 하나만 None이거나 target을 지정하세요.")
+    _get_bundle(target)
 
-    dt = pd.to_datetime(input_data.datetime_str) if input_data.datetime_str \
-         else pd.Timestamp.now()
+    dt = pd.to_datetime(inp.datetime_str) if inp.datetime_str else pd.Timestamp.now()
+    d = inp.model_dump()
+
+    cur = {"co2_in": inp.co2_in, "temp_in": inp.temp_in,
+           "hum_in": inp.hum_in, "soil_hum": inp.soil_hum}
 
     row = {
-        "temp_in":       input_data.temp_in,
-        "hum_in":        input_data.hum_in,
-        "co2_in":        input_data.co2_in,
-        "soil_hum":      input_data.soil_hum,
-        "temp_out":      input_data.temp_out,
-        "rain_out":      input_data.rain_out,
-        "wind_out":      input_data.wind_out,
-        "temp_diff":     input_data.temp_in - input_data.temp_out,
-        "hour":          float(dt.hour),
-        "month":         float(dt.month),
-        "day_of_week":   float(dt.dayofweek),
-        "is_daytime":    float(6 <= dt.hour <= 19),
-        "hour_sin":      float(np.sin(2 * np.pi * dt.hour / 24)),
-        "hour_cos":      float(np.cos(2 * np.pi * dt.hour / 24)),
-        "month_sin":     float(np.sin(2 * np.pi * dt.month / 12)),
-        "month_cos":     float(np.cos(2 * np.pi * dt.month / 12)),
-        # lag1, lag2만 (★ lag3 제거)
-        "temp_in_lag1":  input_data.temp_in_lag1  or input_data.temp_in,
-        "temp_in_lag2":  input_data.temp_in_lag2  or input_data.temp_in,
-        "hum_in_lag1":   input_data.hum_in_lag1   or input_data.hum_in,
-        "hum_in_lag2":   input_data.hum_in_lag2   or input_data.hum_in,
-        "co2_in_lag1":   input_data.co2_in_lag1   or input_data.co2_in,
-        "co2_in_lag2":   input_data.co2_in_lag2   or input_data.co2_in,
-        "soil_hum_lag1": input_data.soil_hum_lag1 or input_data.soil_hum,
-        "soil_hum_lag2": input_data.soil_hum_lag2 or input_data.soil_hum,
+        "hum_in": inp.hum_in, "soil_hum": inp.soil_hum,
+        "temp_out": inp.temp_out, "rain_out": inp.rain_out, "wind_out": inp.wind_out,
+        "hour": float(dt.hour), "month": float(dt.month),
+        "day_of_week": float(dt.dayofweek), "is_daytime": float(6 <= dt.hour <= 19),
+        "hour_sin":  float(np.sin(2 * np.pi * dt.hour / 24)),
+        "hour_cos":  float(np.cos(2 * np.pi * dt.hour / 24)),
+        "month_sin": float(np.sin(2 * np.pi * dt.month / 12)),
+        "month_cos": float(np.cos(2 * np.pi * dt.month / 12)),
     }
+    # 살아있는 센서 현재값(타겟 센서는 None → 피처에도 없음)
+    if inp.co2_in is not None:
+        row["co2_in"] = inp.co2_in
+    if inp.temp_in is not None:
+        row["temp_in"] = inp.temp_in
+        row["temp_diff"] = inp.temp_in - inp.temp_out   # temp 살아있을 때만
 
-    feat_df  = pd.DataFrame([[row[c] for c in FEATURE_COLS]], columns=FEATURE_COLS)
-    co2_pred = _predict_raw(feat_df)
-    control  = _build_control_summary(
-        co2_pred, row["temp_in"], row["hum_in"], row["rain_out"], row["wind_out"]
-    )
+    # lag 채우기
+    for base in LAG_BASES:
+        for L in (1, 2, 3):
+            v = d.get(f"{base}_lag{L}")
+            if v is not None:
+                row[f"{base}_lag{L}"] = float(v)
+            elif base == target:
+                row[f"{base}_lag{L}"] = np.nan                  # 고장 센서 lag 모름
+            elif cur.get(base) is not None:
+                row[f"{base}_lag{L}"] = float(cur[base])        # 살아있는 센서 lag 없으면 현재값
+            else:
+                row[f"{base}_lag{L}"] = np.nan
 
+    pred = _predict(target, row)
+    row[target] = pred   # 제어 계산에 반영
+
+    control = _build_control(row.get("co2_in"), row.get("temp_in"),
+                             inp.hum_in, inp.rain_out, inp.wind_out)
     return {
-        "co2_predicted_ppm": round(co2_pred, 1),
-        "prediction_target": "2시간 후 CO2 농도",           # ★ 수정
+        "target":            target,
+        "predicted_value":   round(pred, 1),
+        "prediction_target": f"{target} 현재 시점 값",
         "control_commands":  control,
         "input_datetime":    dt.isoformat(),
         "timestamp":         datetime.now().isoformat(),

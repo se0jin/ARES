@@ -1,23 +1,22 @@
 """
-02_pipeline.py — 스마트팜 환경 예측 실시간 MLOps 파이프라인  (v3.0)
+02_pipeline.py — 스마트팜 환경 예측 실시간 MLOps 파이프라인  (v4.0 · nowcast)
 =====================================================================
-[v3.0 주요 변경 — 모델 비교·결측 강건성 실험 결과 반영]
-  ① 모델 로딩: bare pkl → 번들(dict: model+features+clip+fault_sensor) 로딩
-       └ 피처 순서/클리핑이 모델과 함께 따라와 '피처 불일치' 버그 차단
-  ② 다중 센서: CO2 단일 예측 → CO2 + 온도 단일 고장 예측 (SENSORS 설정)
-  ③ 결측 학습(augmentation): 재학습 시 고장 센서를 마스킹한 복제본을 추가 학습
-       └ 안 하면 재학습 때마다 결측 취약 모델로 회귀 (R²<0 붕괴)
-  ④ 고장 센서 현재값을 기본값으로 채우지 않고 NaN 그대로 모델에 전달
-       └ augmentation 모델이 결측을 학습된 경로로 처리 (ffill/bfill 제거)
-  ⑤ 예측 시점 3시간으로 통일 (PREDICT_HORIZON_H=3, shift(-3), t→t+3h 매칭)
-       └ 기존 v2.2가 2h였으나 전처리/모델이 3h이므로 정합
-  ⑥ 재학습 성능 게이트를 '고장(마스킹) 시나리오'로 평가 → augmentation 모델 정당 비교
+[v4.0 주요 변경 — 설계 A(nowcast) 전환: '현재 시점 값' 예측]
+  ① 모델 로딩: 번들(dict: model+features+clip+target) 로딩 — 피처 순서/클리핑 동봉
+  ② 다중 센서: CO2 + 온도 단일 고장 예측 (SENSORS 설정)
+     └ DB2 교차 결측: 홀수시 co2_in=Null(co2 예측) / 짝수시 temp_in=Null(temp 예측)
+  ③ 결측 학습(augmentation): 재학습 시 '고장 센서의 lag'를 마스킹한 복제본 추가
+     └ nowcast에선 현재값이 타겟(=피처 아님) → 마스킹 대상은 lag뿐 (원본+lag마스킹=2배)
+  ④ 고장 센서 현재값은 NaN 그대로 전달(애초에 피처에서 제외됨). lag는 예측값 재활용.
+  ⑤ ★ nowcast: 미래 shift 없음. 모델은 '현재 시점' 값을 예측.
+     └ 모니터링은 pred(t) ↔ DB3 actual(t) '같은 시각' 매칭 (t↔t)
+  ⑥ 재학습 성능 게이트는 실제 운영 조건(현재값 제외, lag 有)으로 평가
 
 [배포 전 반드시 확인]
-  - models/lgbm_co2_aug.pkl, models/lgbm_temp_aug.pkl 가 번들 형식으로 존재
+  - models/lgbm_co2_aug.pkl, models/lgbm_temp_aug.pkl 가 번들 형식(target=co2_in/temp_in)
   - DB2(sensor_data_2)에 temp_predicted 컬럼 추가 (UNIQUE 제약 걸지 말 것)
-  - DB3(sensor_data_3)에 temp_in 컬럼 추가 + 하드웨어가 실제 온도 적재
-  - PREDICT_HORIZON_H 값이 전처리 shift 와 동일한지 확인
+  - DB3(sensor_data_3)에 temp_in 컬럼 추가 + 하드웨어가 실제 온도 적재 (없으면 temp 모니터링 스킵)
+  - 전처리 CSV(train/val/test)가 nowcast 버전(원본 co2_in/temp_in이 타겟, next_* 없음)인지
 """
 
 # ─────────────────────────────────────────────────────────────────────
@@ -72,8 +71,9 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
 EXPERIMENT_NAME     = "smartfarm_env_monitoring"
 
-# ── ⑤ 예측 시점 (전처리 shift 와 반드시 동일) ───────────────────────
-PREDICT_HORIZON_H = 3                 # 3시간 후 예측 (shift(-3))
+# ── ⑤ nowcast: 현재 시점 값 예측 (미래 shift 없음, 모니터링 t↔t 동일 시각) ──
+NOWCAST   = True
+LAG_DEPTH = 3                 # 전처리에서 생성한 lag 깊이 (1~3)
 
 # ── 재학습 트리거 임계값 ────────────────────────────────────────────
 RETRAIN_R2_THRESHOLD  = 0.70
@@ -84,14 +84,14 @@ RETRAIN_SCHEDULE_HOUR = 2
 DISCORD_R2_THRESHOLD  = 0.60
 
 # ── ② 센서 설정 (CO2 + 온도 단일 고장) ─────────────────────────────
-#   나머지(model/features/clip/fault_sensor/target)는 번들에서 로드
+#   나머지(model/features/clip/target)는 번들에서 로드
 SENSORS = {
     "co2": {
         "label":        "CO2",
         "unit":         "ppm",
         "bundle_path":  "./models/lgbm_co2_aug.pkl",
         "registry":     "smartfarm_co2_lgbm",
-        "null_col":     "co2_in",         # 고장 시 NULL 인 입력 컬럼
+        "null_col":     "co2_in",         # 고장 시 NULL 인 입력 컬럼 (= 예측 대상)
         "pred_col":     "co2_predicted",  # 예측값 저장 컬럼
         "db3_col":      "co2_in",         # DB3 실제값(모니터링) 컬럼
     },
@@ -138,8 +138,7 @@ def init_clients() -> tuple[Client, Client, Client]:
 
 def load_bundle(path: str | Path) -> dict:
     """
-    ① 번들 로딩. 저장 형식:
-       {model, features, clip:(lo,hi), fault_sensor, target, ...}
+    ① 번들 로딩. 저장 형식: {model, features, clip:(lo,hi), target, mode, ...}
     구버전 bare 모델이면 최소 번들로 감싼다(피처/클립은 폴백).
     """
     obj = joblib.load(path)
@@ -147,11 +146,11 @@ def load_bundle(path: str | Path) -> dict:
         b = obj
     else:  # 폴백: bare 모델
         b = {"model": obj, "features": None, "clip": (None, None),
-             "fault_sensor": None, "target": None}
+             "target": None}
         log.warning(f"{path}: 번들이 아닌 bare 모델 — 피처/클립 정보 없음")
     b["lag_depth"] = _lag_depth(b.get("features"))
     log.info(
-        f"모델 로드: {path}  타겟={b.get('target')}  "
+        f"모델 로드: {path}  타겟={b.get('target')}  mode={b.get('mode','nowcast')}  "
         f"피처={len(b['features']) if b.get('features') else '?'}개  "
         f"clip={b.get('clip')}  lag_depth={b['lag_depth']}"
     )
@@ -160,7 +159,7 @@ def load_bundle(path: str | Path) -> dict:
 
 def _lag_depth(features) -> int:
     if not features:
-        return PREDICT_HORIZON_H
+        return LAG_DEPTH
     idxs = []
     for f in features:
         m = re.search(r"_lag(\d+)$", f)
@@ -184,8 +183,8 @@ def build_features(target_row: dict, lag_rows: list[dict],
     DB2 신규 1행 + 직전 lag 행 → 모델 피처 DataFrame(1행)
 
     ④ 핵심: 고장 센서(fault_base)의 현재값·현재 파생은 NaN 그대로 둔다.
-       augmentation 모델이 결측을 학습된 경로로 처리하므로 임의 값으로
-       채우지 않는다. (lag 는 예측값 재활용으로 채움 = mild 패턴)
+       nowcast에선 현재값이 '예측 대상'이라 애초에 features에 없음. lag 는
+       이전 예측값(pred_col)을 재활용해 채운다(교차 결측 대응).
     """
     row = dict(target_row)
     dt = pd.to_datetime(row["datetime"])
@@ -208,7 +207,7 @@ def build_features(target_row: dict, lag_rows: list[dict],
 
     # temp_in / temp_diff
     if fault_base == "temp_in":
-        row["temp_in"]   = np.nan          # ④ 고장 → NaN 유지
+        row["temp_in"]   = np.nan          # ④ 고장 → NaN (features에도 없음)
         row["temp_diff"] = np.nan
     else:
         ti = ctx("temp_in"); row["temp_in"] = ti
@@ -236,7 +235,7 @@ def build_features(target_row: dict, lag_rows: list[dict],
     feat_df = pd.DataFrame([{k: row.get(k, np.nan) for k in features}])
     for col in feat_df.columns:
         feat_df[col] = pd.to_numeric(feat_df[col], errors="coerce")
-    # ④ ffill/bfill 제거 — 고장 센서 NaN 을 모델이 직접 처리
+    # ④ ffill/bfill 없음 — 고장 센서 NaN 을 모델이 직접 처리
     return feat_df
 
 
@@ -292,7 +291,7 @@ def poll_and_predict(db2: Client, bundles: dict[str, dict]) -> list[dict]:
                     {cfg["pred_col"]: round(pred, 2)}
                 ).eq("ID", r["ID"]).execute()
 
-                log.info(f"  [{name}][{dt_str}] {cfg['pred_col']} = {pred:.1f} {cfg['unit']}")
+                log.info(f"  [{name}][{dt_str}] {cfg['pred_col']} = {pred:.1f} {cfg['unit']} (현재값 추정)")
                 r[cfg["pred_col"]] = pred
                 r["_sensor"] = name
                 predicted.append(r)
@@ -425,12 +424,12 @@ def run_ks_test(ref_values: np.ndarray, curr_values: np.ndarray, feature_name="c
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 8. 모니터링 — 센서별 예측 vs 실제 (t → t+Hh 매칭)
+# 8. 모니터링 — 센서별 예측 vs 실제 (⑤ t ↔ t 같은 시각 매칭)
 # ─────────────────────────────────────────────────────────────────────
 def run_monitoring(db2: Client, db3: Client, cfg: dict,
                    ref_values: np.ndarray | None = None) -> dict | None:
     """
-    ⑤ pred(t) ↔ DB3 actual(t+PREDICT_HORIZON_H) 시프트 매칭.
+    ⑤ nowcast: pred(t) ↔ DB3 actual(t) '같은 시각' 매칭.
     DB3 에 해당 센서 컬럼이 없으면(예: temp_in 미추가) 안전하게 스킵.
     """
     name, pred_col, db3_col, unit = cfg["label"], cfg["pred_col"], cfg["db3_col"], cfg["unit"]
@@ -461,13 +460,13 @@ def run_monitoring(db2: Client, db3: Client, cfg: dict,
 
     pred_df["dt_hour"]   = pd.to_datetime(pred_df["datetime"], format="mixed", utc=True).dt.floor("h")
     actual_df["dt_hour"] = pd.to_datetime(actual_df["datetime"], format="mixed", utc=True).dt.floor("h")
-    pred_df["dt_match"]  = pred_df["dt_hour"] + pd.Timedelta(hours=PREDICT_HORIZON_H)   # ⑤
 
+    # ⑤ nowcast — 같은 시각(t↔t) 매칭
     merged = pd.merge(
-        pred_df[["dt_match", pred_col]], actual_df[["dt_hour", db3_col]],
-        left_on="dt_match", right_on="dt_hour", how="inner",
+        pred_df[["dt_hour", pred_col]], actual_df[["dt_hour", db3_col]],
+        on="dt_hour", how="inner",
     )
-    log.info(f"[모니터링·{name}] 시프트 매칭 (t→t+{PREDICT_HORIZON_H}h): {len(merged)}개")
+    log.info(f"[모니터링·{name}] 동일 시각 매칭 (t↔t): {len(merged)}개")
     if len(merged) < 5:
         log.warning(f"[모니터링·{name}] 매칭 부족 ({len(merged)}개) — 대기")
         return None
@@ -506,9 +505,9 @@ def run_monitoring(db2: Client, db3: Client, cfg: dict,
     try:
         with mlflow.start_run(run_name=f"monitor_{name}_{datetime.now().strftime('%Y%m%d_%H%M')}"):
             mlflow.log_params({
-                "sensor": name, "horizon_h": PREDICT_HORIZON_H,
+                "sensor": name, "mode": "nowcast",
                 "monitoring_window": RETRAIN_WINDOW, "n_samples": len(merged),
-                "match_mode": f"t_to_t+{PREDICT_HORIZON_H}h_shift",
+                "match_mode": "t_to_t_same_hour",
             })
             mlflow.log_metrics({
                 f"{cfg['pred_col']}_rmse": rmse, f"{cfg['pred_col']}_mae": mae,
@@ -538,30 +537,28 @@ def run_monitoring(db2: Client, db3: Client, cfg: dict,
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 9. 학습용 피처 엔지니어링 + Augmentation
+# 9. 학습용 피처 엔지니어링 + Augmentation  (nowcast)
 # ─────────────────────────────────────────────────────────────────────
 def build_train_features(raw_df: pd.DataFrame, features: list[str]) -> pd.DataFrame:
     """
-    DB1 원본 → 학습 피처 + 두 타겟(next_co2_in, next_temp_in) 생성.
-    ⑤ shift(-PREDICT_HORIZON_H), lag1..lag_depth.
+    DB1 원본 → 학습 피처 생성 (nowcast).
+    ⑤ 타겟 = 원본 현재값 컬럼(co2_in, temp_in) 자체. shift/next_* 없음.
+       미래 행을 끌어오지 않으므로 future-leak(gap_before) 처리도 불필요.
     """
-    depth = _lag_depth(features) or PREDICT_HORIZON_H
+    depth = _lag_depth(features) or LAG_DEPTH
     df = raw_df.copy().sort_values("datetime").reset_index(drop=True)
     df["datetime"] = pd.to_datetime(df["datetime"], format="mixed", utc=True)
 
-    # 시간 비연속 구간(1시간 간격 위반) 오염 처리
+    # 시간 비연속 구간(1시간 간격 위반) → lag 오염 행만 NaN 처리
     step_h = df["datetime"].diff().dt.total_seconds() / 3600
     gap_after = set(df.index[step_h > 1.5].tolist())
-    gap_before, gap_lag = set(), set()
+    gap_lag = set()
     for idx in gap_after:
-        for k in range(1, PREDICT_HORIZON_H + 1):
-            if idx - k >= 0:
-                gap_before.add(idx - k)
         for k in range(0, depth + 1):
             if idx + k < len(df):
                 gap_lag.add(idx + k)
     if gap_after:
-        log.warning(f"비연속 구간 {len(gap_after)}개 → 오염 행 타겟/lag NaN 처리")
+        log.warning(f"비연속 구간 {len(gap_after)}개 → lag 오염 행 NaN 처리")
 
     df["hour"]        = df["datetime"].dt.hour
     df["month"]       = df["datetime"].dt.month
@@ -586,34 +583,29 @@ def build_train_features(raw_df: pd.DataFrame, features: list[str]) -> pd.DataFr
     if gap_lag:
         df.loc[list(gap_lag), [c for c in lag_cols if c in df.columns]] = np.nan
 
-    # 타겟: 두 센서 모두 shift(-HORIZON)
-    for base in ("co2_in", "temp_in"):
-        df[f"next_{base}"] = df[base].shift(-PREDICT_HORIZON_H)
-        if gap_before:
-            df.loc[list(gap_before), f"next_{base}"] = np.nan
-
-    log.info(f"학습 피처 생성 완료: {len(df):,}행 (lag_depth={depth})")
+    # ⑤ nowcast: 타겟은 원본 co2_in / temp_in (이미 컬럼으로 존재) — 별도 생성 없음
+    log.info(f"학습 피처 생성 완료(nowcast): {len(df):,}행 (lag_depth={depth})")
     return df
 
 
 def make_aug_train(df: pd.DataFrame, fault_base: str, features: list[str]) -> pd.DataFrame:
     """
-    ③ Missingness Augmentation: 고장 센서를 마스킹한 복제본을 추가.
-       원본 + 경증(현재값 NaN) + 중증(현재값+lag NaN) = 3배.
+    ③ nowcast Augmentation: '고장 센서의 lag'만 마스킹한 복제본을 추가.
+       현재값은 타겟(=피처 아님)이라 마스킹 대상이 아님.
+       원본(직후고장·lag有) + lag마스킹본(장기고장·lag NaN) = 2배.
     """
-    cur = [fault_base] + (["temp_diff"] if fault_base == "temp_in" else [])
-    cur = [c for c in cur if c in features]
     lags = [c for c in features if c.startswith(fault_base + "_lag")]
-    d_mild = df.copy(); d_mild[cur] = np.nan
-    d_sev  = df.copy(); d_sev[cur + lags] = np.nan
-    return pd.concat([df, d_mild, d_sev], ignore_index=True)
+    d_long = df.copy()
+    if lags:
+        d_long[lags] = np.nan
+    return pd.concat([df, d_long], ignore_index=True)
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 10. 자동 재학습 (센서별, augmentation + 고장 시나리오 게이트)
+# 10. 자동 재학습 (센서별, augmentation + 운영 시나리오 게이트)
 # ─────────────────────────────────────────────────────────────────────
 def _load_train_val_test(db1: Client, features: list[str]):
-    """전처리 CSV 우선, 없으면 DB1 원본 → build_train_features."""
+    """전처리 CSV 우선, 없으면 DB1 원본 → build_train_features(nowcast)."""
     for tr, va, te in [
         (Path("./data/train.csv"), Path("./data/val.csv"), Path("./data/test.csv")),
         (Path("/app/data/train.csv"), Path("/app/data/val.csv"), Path("/app/data/test.csv")),
@@ -638,7 +630,8 @@ def _load_train_val_test(db1: Client, features: list[str]):
     if len(raw) < RETRAIN_DATA_MIN_ROWS:
         return None, None, None
     feat = build_train_features(raw, features)
-    feat = feat.dropna(subset=features + ["next_co2_in", "next_temp_in"]).reset_index(drop=True)
+    raw_targets = [c for c in ("co2_in", "temp_in") if c in feat.columns]
+    feat = feat.dropna(subset=features + raw_targets).reset_index(drop=True)
     if len(feat) < RETRAIN_DATA_MIN_ROWS:
         return None, None, None
     n = len(feat)
@@ -646,19 +639,20 @@ def _load_train_val_test(db1: Client, features: list[str]):
 
 
 def _mask_fault(X: pd.DataFrame, fault_base: str, features: list[str]) -> pd.DataFrame:
-    """⑥ 재학습 성능 게이트용 — 고장(경증) 시나리오로 test 마스킹."""
-    Xm = X.copy()
-    cols = [fault_base] + (["temp_diff"] if fault_base == "temp_in" else [])
-    Xm[[c for c in cols if c in features]] = np.nan
-    return Xm
+    """
+    ⑥ nowcast 게이트: 현재값은 이미 features에서 제외돼 있어(고장 가정 내장)
+       추가 마스킹 없이 실제 운영 입력 그대로 평가한다.
+       (교차 시뮬레이션은 항상 1시간 고장 → lag가 살아있는 조건이 운영 기준)
+    """
+    return X.copy()
 
 
 def run_retrain(db1: Client, name: str, bundle: dict, trigger_reason="manual") -> dict | None:
-    """③⑥ 센서별 재학습: augmentation 학습 → 고장 시나리오로 현재 모델과 비교 → 승격."""
+    """③⑥ 센서별 재학습: augmentation 학습 → 운영 시나리오로 현재 모델과 비교 → 승격."""
     cfg = SENSORS[name]
-    features  = bundle["features"]
+    features   = bundle["features"]
     fault_base = cfg["null_col"]
-    target_col = bundle.get("target") or f"next_{fault_base}"
+    target_col = bundle.get("target") or fault_base   # nowcast: 원본 현재값 컬럼
     log.info(f"=== [재학습·{name}] 트리거: {trigger_reason} ===")
 
     if features is None:
@@ -675,7 +669,7 @@ def run_retrain(db1: Client, name: str, bundle: dict, trigger_reason="manual") -
                 log.warning(f"[재학습·{name}] 타겟 '{target_col}' 없음 — 스킵")
                 return None
 
-        # ③ augmentation 학습셋
+        # ③ augmentation 학습셋 (원본 + lag 마스킹)
         aug = make_aug_train(train_df, fault_base, features)
         X_tr, y_tr = aug[features], aug[target_col]
         X_va, y_va = val_df[features], val_df[target_col]
@@ -686,12 +680,12 @@ def run_retrain(db1: Client, name: str, bundle: dict, trigger_reason="manual") -
         new_model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)],
                       callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(200)])
 
-        # ⑥ 고장(경증) 시나리오로 평가 — 실제 배포 조건
-        X_te_fault = _mask_fault(X_te, fault_base, features)
-        r2_new   = float(r2_score(y_te, new_model.predict(X_te_fault)))
-        rmse_new = float(np.sqrt(mean_squared_error(y_te, new_model.predict(X_te_fault))))
-        r2_curr  = float(r2_score(y_te, bundle["model"].predict(X_te_fault)))
-        log.info(f"[재학습·{name}] 고장 시나리오 R² — 신규={r2_new:.4f} / 기존={r2_curr:.4f}")
+        # ⑥ 운영 시나리오(현재값 제외·lag 有)로 평가 — 신규 vs 기존 동일 조건
+        X_te_eval = _mask_fault(X_te, fault_base, features)
+        r2_new   = float(r2_score(y_te, new_model.predict(X_te_eval)))
+        rmse_new = float(np.sqrt(mean_squared_error(y_te, new_model.predict(X_te_eval))))
+        r2_curr  = float(r2_score(y_te, bundle["model"].predict(X_te_eval)))
+        log.info(f"[재학습·{name}] 운영 시나리오 R² — 신규={r2_new:.4f} / 기존={r2_curr:.4f}")
 
         if r2_new <= r2_curr:
             log.warning(f"[재학습·{name}] 성능 미달 — 교체 보류")
@@ -700,8 +694,8 @@ def run_retrain(db1: Client, name: str, bundle: dict, trigger_reason="manual") -
 
         # 번들 갱신 후 저장 (피처/클립/타겟 유지)
         new_bundle = dict(bundle)
-        new_bundle.update({"model": new_model, "trained_with": "missingness_augmentation(mild+severe)",
-                           "fault_sensor": fault_base, "target": target_col})
+        new_bundle.update({"model": new_model, "trained_with": "lag_missingness_augmentation(long_fault)",
+                           "mode": "nowcast", "target": target_col})
         path = Path(cfg["bundle_path"]); path.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump(new_bundle, path)
         new_bundle["lag_depth"] = _lag_depth(features)
@@ -709,10 +703,10 @@ def run_retrain(db1: Client, name: str, bundle: dict, trigger_reason="manual") -
 
         try:
             with mlflow.start_run(run_name=f"retrain_{name}_{datetime.now().strftime('%Y%m%d_%H%M')}"):
-                mlflow.log_params({"sensor": name, "trigger": trigger_reason,
-                                   "train_rows_aug": len(aug), "r2_previous_fault": r2_curr})
-                mlflow.log_metrics({"test_r2_fault": r2_new, "test_rmse_fault": rmse_new,
-                                    "r2_improvement_fault": r2_new - r2_curr})
+                mlflow.log_params({"sensor": name, "trigger": trigger_reason, "mode": "nowcast",
+                                   "train_rows_aug": len(aug), "r2_previous": r2_curr})
+                mlflow.log_metrics({"test_r2": r2_new, "test_rmse": rmse_new,
+                                    "r2_improvement": r2_new - r2_curr})
                 mlflow.sklearn.log_model(new_model, artifact_path=name,
                                          registered_model_name=cfg["registry"])
                 from mlflow.tracking import MlflowClient
@@ -723,7 +717,7 @@ def run_retrain(db1: Client, name: str, bundle: dict, trigger_reason="manual") -
                         name=cfg["registry"], version=vers[-1].version,
                         stage="Production", archive_existing_versions=True)
                     log.info(f"[{name}] Registry v{vers[-1].version} → Production")
-            send_discord_alert(f"✅ [{name} 재학습+승격] 고장 R²={r2_new:.4f} > {r2_curr:.4f} "
+            send_discord_alert(f"✅ [{name} 재학습+승격] R²={r2_new:.4f} > {r2_curr:.4f} "
                                f"RMSE={rmse_new:.2f}{cfg['unit']}")
         except Exception as e:
             log.warning(f"[{name}] MLflow/Registry 실패: {e}")
@@ -768,7 +762,7 @@ class Pipeline:
 
         predicted = poll_and_predict(self.db2, self.bundles)
 
-        # 제어 — 예측·실측을 coalesce 해서 사용
+        # 제어 — 예측·실측을 coalesce 해서 사용 (매시 한쪽은 실측, 한쪽은 예측)
         for row in predicted:
             try:
                 co2  = float(row.get("co2_predicted")  or row.get("co2_in")  or 700)
@@ -826,7 +820,7 @@ class Pipeline:
 # ─────────────────────────────────────────────────────────────────────
 def main():
     log.info("=" * 65)
-    log.info("스마트팜 MLOps 파이프라인 시작 (v3.0 — 다중 센서 + augmentation)")
+    log.info("스마트팜 MLOps 파이프라인 시작 (v4.0 — nowcast · 다중 센서 + augmentation)")
     log.info("=" * 65)
 
     pipeline = Pipeline()

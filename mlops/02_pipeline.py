@@ -81,7 +81,23 @@ KS_PVALUE_THRESHOLD   = 0.05
 RETRAIN_WINDOW        = 48
 RETRAIN_DATA_MIN_ROWS = 500
 RETRAIN_SCHEDULE_HOUR = 2
-DISCORD_R2_THRESHOLD  = 0.60
+DISCORD_R2_THRESHOLD  = 0.60   # (구) R² 단독 경고 임계 — 융합 판단 도입 후 폴백용으로만 잔류
+
+# ── 재학습 트리거: RMSE·MAE·R² 융합 (상대 열화 + 다수결) ──────────────
+#   교수 피드백 반영: R² 단독이 아니라 세 지표를 종합해 판단.
+#   - REF = 모델 Test(직후고장·lag 有) 기준 성능. 재학습 성공 시 자동 갱신.
+#   - 각 지표를 '기준 대비 상대 열화'로 평가(스케일 다른 co2/temp를 한 함수로).
+#   - R²은 소표본·저분산에서 음수로 폭주(예: -716)하므로 R2_FLOOR로 클립 후 비교.
+#   - 3개 중 FUSION_MIN_VOTES개 이상 '열화'일 때만 트리거(단일 지표 오탐 차단).
+REF_METRICS = {
+    "co2":  {"rmse": 43.70, "mae": 33.54, "r2": 0.669},   # 신규 nowcast Test(직후고장)
+    "temp": {"rmse": 1.65,  "mae": 1.22,  "r2": 0.838},
+}
+RMSE_DEGRADE_RATIO = 1.5    # RMSE > 기준×1.5  → 열화 1표
+MAE_DEGRADE_RATIO  = 1.5    # MAE  > 기준×1.5  → 열화 1표
+R2_DROP_ABS        = 0.20   # R²   < 기준−0.2  → 열화 1표
+R2_FLOOR           = -1.0   # 소표본 음수 R² 폭주 방어 클립
+FUSION_MIN_VOTES   = 2      # 3개 지표 중 N개 이상 동의 시 재학습
 
 # ── ② 센서 설정 (CO2 + 온도 단일 고장) ─────────────────────────────
 #   나머지(model/features/clip/target)는 번들에서 로드
@@ -478,7 +494,8 @@ def run_monitoring(db2: Client, db3: Client, cfg: dict,
     r2   = float(r2_score(y_true, y_pred))
     denom = np.where(np.abs(y_true) < 1.0, 1.0, np.abs(y_true))
     mape  = float(np.mean(np.abs((y_true - y_pred) / denom)) * 100)
-    log.info(f"[모니터링·{name}] n={len(merged)} RMSE={rmse:.2f} MAE={mae:.2f} R²={r2:.4f} MAPE={mape:.2f}%")
+    y_std = float(np.std(y_true))
+    log.info(f"[모니터링·{name}] n={len(merged)} RMSE={rmse:.2f} MAE={mae:.2f} R²={r2:.4f} MAPE={mape:.2f}% (실측std={y_std:.2f})")
 
     ks_result = run_ks_test(ref_values, y_pred, feature_name=pred_col)
 
@@ -518,22 +535,49 @@ def run_monitoring(db2: Client, db3: Client, cfg: dict,
     except Exception as e:
         log.warning(f"MLflow 기록 실패: {e}")
 
-    if r2 < DISCORD_R2_THRESHOLD:
-        send_discord_alert(
-            f"🚨 [{name} 모델 경고] R²={r2:.4f} < {DISCORD_R2_THRESHOLD}\n"
-            f"RMSE={rmse:.2f}{unit} | MAPE={mape:.2f}%\n"
-            f"{datetime.now().strftime('%Y-%m-%d %H:%M')} → 재학습 검토"
-        )
+    # 성능 열화 경고/트리거 판단은 hourly_step의 fusion_retrain_decision()에서 일괄 처리.
+    # (여기서는 분포 드리프트만 별도 경고 — 성능 지표와 직교)
     if drift_detected:
         kp = ks_result["ks_pvalue"]
         send_discord_alert(
             f"⚠️ [{name} 드리프트] KS p={f'{kp:.4f}' if kp is not None else 'N/A'} | "
-            f"Evidently={evidently_drift}\n→ 재학습 트리거"
+            f"Evidently={evidently_drift}\n→ 재학습 트리거 검토"
         )
 
-    return {"rmse": rmse, "mae": mae, "r2": r2, "mape": mape,
+    return {"rmse": rmse, "mae": mae, "r2": r2, "mape": mape, "y_std": y_std,
             "drift_detected": drift_detected, "ks_pvalue": ks_result["ks_pvalue"],
             "n_samples": len(merged)}
+
+
+# ── 8-B. 재학습 트리거 판단 — RMSE·MAE·R² 융합 (상대 열화 + 다수결) ──
+def fusion_retrain_decision(name: str, m: dict) -> tuple[bool, list[str]]:
+    """
+    교수 피드백 반영: R² 단독이 아니라 RMSE·MAE·R² 세 지표를 종합해 판단.
+      - 각 지표를 '기준(REF) 대비 상대 열화'로 평가 (스케일 다른 co2/temp를 한 함수로)
+      - R²은 소표본·저분산에서 음수로 폭주(예: -716)하므로 R2_FLOOR로 클립 후 비교
+      - 3개 중 FUSION_MIN_VOTES개 이상이 '열화'면 재학습 트리거 (단일 지표 오탐 차단)
+    """
+    ref = REF_METRICS.get(name)
+    if ref is None:   # 기준 미설정 → 보수적 R² 단독 폴백
+        deg = m["r2"] < RETRAIN_R2_THRESHOLD
+        return deg, [f"R²={m['r2']:.3f} {'<' if deg else '≥'} {RETRAIN_R2_THRESHOLD} (기준 미설정 폴백)"]
+
+    rmse_thr = ref["rmse"] * RMSE_DEGRADE_RATIO
+    mae_thr  = ref["mae"]  * MAE_DEGRADE_RATIO
+    r2_thr   = ref["r2"]   - R2_DROP_ABS
+    r2_clip  = max(m["r2"], R2_FLOOR)   # 소표본 음수 R² 폭주 무력화
+
+    votes, reasons = [], []
+    if m["rmse"] > rmse_thr:
+        votes.append("RMSE"); reasons.append(f"RMSE {m['rmse']:.2f}>{rmse_thr:.2f}")
+    if m["mae"] > mae_thr:
+        votes.append("MAE");  reasons.append(f"MAE {m['mae']:.2f}>{mae_thr:.2f}")
+    if r2_clip < r2_thr:
+        votes.append("R2");   reasons.append(f"R²(clip) {r2_clip:.2f}<{r2_thr:.2f}")
+
+    trigger = len(votes) >= FUSION_MIN_VOTES
+    reasons.append(f"열화 {len(votes)}/3표" if votes else "3개 지표 모두 정상")
+    return trigger, reasons
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -682,14 +726,25 @@ def run_retrain(db1: Client, name: str, bundle: dict, trigger_reason="manual") -
 
         # ⑥ 운영 시나리오(현재값 제외·lag 有)로 평가 — 신규 vs 기존 동일 조건
         X_te_eval = _mask_fault(X_te, fault_base, features)
-        r2_new   = float(r2_score(y_te, new_model.predict(X_te_eval)))
-        rmse_new = float(np.sqrt(mean_squared_error(y_te, new_model.predict(X_te_eval))))
-        r2_curr  = float(r2_score(y_te, bundle["model"].predict(X_te_eval)))
-        log.info(f"[재학습·{name}] 운영 시나리오 R² — 신규={r2_new:.4f} / 기존={r2_curr:.4f}")
+        pred_new  = new_model.predict(X_te_eval)
+        pred_curr = bundle["model"].predict(X_te_eval)
+        r2_new    = float(r2_score(y_te, pred_new))
+        rmse_new  = float(np.sqrt(mean_squared_error(y_te, pred_new)))
+        mae_new   = float(mean_absolute_error(y_te, pred_new))
+        r2_curr   = float(r2_score(y_te, pred_curr))
+        rmse_curr = float(np.sqrt(mean_squared_error(y_te, pred_curr)))
+        log.info(f"[재학습·{name}] 신규 R²={r2_new:.4f}/RMSE={rmse_new:.2f} "
+                 f"vs 기존 R²={r2_curr:.4f}/RMSE={rmse_curr:.2f}")
 
-        if r2_new <= r2_curr:
-            log.warning(f"[재학습·{name}] 성능 미달 — 교체 보류")
-            send_discord_alert(f"ℹ️ [{name} 재학습·보류] 신규 R²={r2_new:.4f} ≤ 기존 {r2_curr:.4f}")
+        # 융합 승격 게이트: RMSE 개선(또는 동급) + R² 비악화 (둘 중 하나라도 악화면 보류)
+        improved = (rmse_new <= rmse_curr) and (r2_new >= r2_curr - 0.01)
+        if not improved:
+            log.warning(f"[재학습·{name}] 성능 미달 — 교체 보류 "
+                        f"(RMSE {rmse_new:.2f} vs {rmse_curr:.2f}, R² {r2_new:.3f} vs {r2_curr:.3f})")
+            send_discord_alert(
+                f"ℹ️ [{cfg['label']} 재학습·보류] 신규 RMSE={rmse_new:.2f}/R²={r2_new:.3f} "
+                f"≤ 기존 RMSE={rmse_curr:.2f}/R²={r2_curr:.3f}"
+            )
             return None
 
         # 번들 갱신 후 저장 (피처/클립/타겟 유지)
@@ -701,12 +756,19 @@ def run_retrain(db1: Client, name: str, bundle: dict, trigger_reason="manual") -
         new_bundle["lag_depth"] = _lag_depth(features)
         log.info(f"[재학습·{name}] 번들 갱신: {path}")
 
+        # 재학습 성공 → 융합 트리거 기준(REF) 갱신: 새 모델의 운영 성능으로 최신화
+        if name in REF_METRICS:
+            REF_METRICS[name] = {"rmse": rmse_new, "mae": mae_new, "r2": r2_new}
+            log.info(f"[재학습·{name}] REF 갱신 → {REF_METRICS[name]}")
+
         try:
             with mlflow.start_run(run_name=f"retrain_{name}_{datetime.now().strftime('%Y%m%d_%H%M')}"):
                 mlflow.log_params({"sensor": name, "trigger": trigger_reason, "mode": "nowcast",
-                                   "train_rows_aug": len(aug), "r2_previous": r2_curr})
-                mlflow.log_metrics({"test_r2": r2_new, "test_rmse": rmse_new,
-                                    "r2_improvement": r2_new - r2_curr})
+                                   "train_rows_aug": len(aug), "r2_previous": r2_curr,
+                                   "rmse_previous": rmse_curr})
+                mlflow.log_metrics({"test_r2": r2_new, "test_rmse": rmse_new, "test_mae": mae_new,
+                                    "r2_improvement": r2_new - r2_curr,
+                                    "rmse_improvement": rmse_curr - rmse_new})
                 mlflow.sklearn.log_model(new_model, artifact_path=name,
                                          registered_model_name=cfg["registry"])
                 from mlflow.tracking import MlflowClient
@@ -717,8 +779,8 @@ def run_retrain(db1: Client, name: str, bundle: dict, trigger_reason="manual") -
                         name=cfg["registry"], version=vers[-1].version,
                         stage="Production", archive_existing_versions=True)
                     log.info(f"[{name}] Registry v{vers[-1].version} → Production")
-            send_discord_alert(f"✅ [{name} 재학습+승격] R²={r2_new:.4f} > {r2_curr:.4f} "
-                               f"RMSE={rmse_new:.2f}{cfg['unit']}")
+            send_discord_alert(f"✅ [{cfg['label']} 재학습+승격] R²={r2_new:.4f} (기존 {r2_curr:.4f}) "
+                               f"RMSE={rmse_new:.2f}{cfg['unit']} (기존 {rmse_curr:.2f})")
         except Exception as e:
             log.warning(f"[{name}] MLflow/Registry 실패: {e}")
 
@@ -780,26 +842,39 @@ class Pipeline:
             except Exception as e:
                 log.error(f"제어 계산 오류: {e}")
 
-        # 센서별 모니터링 + 트리거
+        # 센서별 모니터링 + 트리거 (RMSE·MAE·R² 융합 판단)
         for name, cfg in SENSORS.items():
             metrics = run_monitoring(self.db2, self.db3, cfg, ref_values=self.ref[name])
             if metrics is None:
                 continue
+
+            # ── 성능 열화: 세 지표 융합 (상대 열화 + 다수결) ──
+            perf_degraded, reasons = fusion_retrain_decision(name, metrics)
+            log.info(f"[재학습 판단·{name}] {'열화' if perf_degraded else '정상'} | "
+                     + " · ".join(reasons))
+
             trigger = None
-            if metrics["r2"] < RETRAIN_R2_THRESHOLD:
-                trigger = "r2_drop"
+            if perf_degraded:
+                trigger = "perf_fusion"
+                send_discord_alert(
+                    f"🚨 [{cfg['label']} 성능 열화·재학습] " + " · ".join(reasons) +
+                    f"\n(n={metrics['n_samples']}, RMSE={metrics['rmse']:.2f}{cfg['unit']} "
+                    f"MAE={metrics['mae']:.2f} R²={metrics['r2']:.3f})"
+                )
             elif metrics["drift_detected"]:
                 kp = metrics.get("ks_pvalue")
                 trigger = "ks_drift" if (kp and kp < KS_PVALUE_THRESHOLD) else "evidently_drift"
+
             if trigger:
-                log.warning(f"🔄 [{name}] 재학습 트리거: {trigger} R²={metrics['r2']:.4f}")
+                log.warning(f"🔄 [{name}] 재학습 트리거: {trigger} | "
+                            f"RMSE={metrics['rmse']:.2f} MAE={metrics['mae']:.2f} R²={metrics['r2']:.3f}")
                 nb = run_retrain(self.db1, name, self.bundles[name], trigger_reason=trigger)
                 if nb is not None:
                     self.bundles[name] = nb
                     self.ref[name] = self._load_ref(cfg["db3_col"])
                     log.info(f"✅ [{name}] 모델 핫스왑 완료")
             else:
-                log.info(f"✅ [{name}] 성능 정상 (R²={metrics['r2']:.4f})")
+                log.info(f"✅ [{name}] 성능 정상 (RMSE={metrics['rmse']:.2f} R²={metrics['r2']:.3f})")
 
         log.info("[HOURLY STEP] 완료")
 
@@ -820,7 +895,7 @@ class Pipeline:
 # ─────────────────────────────────────────────────────────────────────
 def main():
     log.info("=" * 65)
-    log.info("스마트팜 MLOps 파이프라인 시작 (v4.0 — nowcast · 다중 센서 + augmentation)")
+    log.info("스마트팜 MLOps 파이프라인 시작 (v4.1 — nowcast · 다중 센서 + augmentation + 융합 트리거)")
     log.info("=" * 65)
 
     pipeline = Pipeline()
